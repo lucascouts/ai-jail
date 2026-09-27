@@ -222,6 +222,23 @@ Code creates that directory unconditionally at startup and ignores `TMPDIR`;
 unlike the session directory, it persists between runs. Use a map or
 `--agent-state` for anything durable.
 
+### Read-only holes in a writable map
+
+A `--map` strictly inside a `--rw-map` stays read-only (Linux): maps are
+mounted parent-first, so the read-only child sits on top of the writable
+parent, and the sandbox can neither unmount it (no capabilities, and seccomp
+denies every mount syscall) nor rename or delete it (it is a mount point).
+That lets agent state stay writable while the files a *later, unjailed*
+session would execute do not:
+
+```bash
+ai-jail --rw-map ~/.claude --rw-map ~/.claude.json \
+  --map ~/.claude/hooks --map ~/.claude/settings.json claude
+```
+
+The reverse is refused with a warning: a `--rw-map` at or under a `--map`
+destination is dropped, because a read-only map is a policy boundary.
+
 ## Browsers
 
 `--browser[=hard|soft]` reuses an isolated browser profile, but browsers still
