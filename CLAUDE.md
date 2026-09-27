@@ -22,6 +22,7 @@ src/
     seatbelt.rs   -- sandbox-exec SBPL profile generation (macOS)
   pty.rs          -- PTY proxy with vt100 virtual terminal (raw mode, IO loop, diff rendering)
   statusbar.rs    -- persistent terminal status bar overlay (redraw, update check)
+  transparent.rs  -- --transparent-egress: fake resolver + loopback listeners in a supervisor-side helper (Linux)
   signals.rs      -- signal forwarding + child process reaping
   output.rs       -- colored terminal output helpers (raw ANSI, no deps)
   bootstrap.rs    -- AI tool config generation (Claude, Codex, OpenCode)
@@ -87,7 +88,7 @@ There are regression tests in `src/config.rs` that parse old config file formats
 ## Coding Conventions
 
 - **No async, no tokio.** This is a synchronous CLI tool.
-- **Minimal dependencies.** Current deps: `lexopt`, `serde`, `toml`, `serde_json`, `vt100`, `nix`, `landlock`, `seccompiler` (Linux). Do not add new crates without a strong justification.
+- **Minimal dependencies.** Current deps: `lexopt`, `serde`, `toml`, `serde_json`, `vt100`, `nix` (its `sched` feature provides `setns` for the transparent-egress helper), `landlock`, `seccompiler` (Linux). Do not add new crates without a strong justification.
 - **No clap.** We use `lexopt` for argument parsing to keep the binary small.
 - **Raw ANSI for colors.** No color crate — `output.rs` handles this with raw escape codes.
 - **Warn and skip, never crash.** Missing paths, unreadable dirs, and non-critical errors produce a warning and continue. Existing `.ai-jail` files that cannot be read or parsed are fatal because silently dropping sandbox policy would fail open. Other fatal errors include no bwrap and an unavailable current directory.

@@ -186,6 +186,23 @@ no UDP, and no working DNS inside the sandbox on Linux (on macOS the system
 resolver is not fenced). It cannot combine with `--network` or `--browser`,
 and a project `.ai-jail` may only shrink the list, never grow it.
 
+### Clients that ignore the proxy: `--transparent-egress`
+
+Filtered egress reaches clients that honor `HTTPS_PROXY`. A client with its
+own HTTP agent or raw sockets resolves DNS itself, finds none, and fails.
+`--transparent-egress` (Linux; with `--allow-host`) routes those clients
+through the same proxy: the sandbox's resolver answers each allowlisted name
+with a private loopback address (`127.64.0.0/10`) and everything else with
+NXDOMAIN, and connections to those addresses on ports 80 and 443 become
+`CONNECT name:port` to the unchanged proxy. The allowlist, SSRF guard and
+DNS pinning stay on the host; nothing is resolved inside the sandbox, so
+there is no DNS channel out.
+
+The resolver and listeners need privileged ports, which the agent must never
+hold, so they run in a supervisor-side helper that joins only the sandbox's
+user and network namespaces, binds, drops every capability, and only then
+lets the agent start. The agent itself keeps zero capabilities.
+
 ### Phantom credentials: `--secret KEY=host`
 
 With filtered egress on, `--secret ANTHROPIC_API_KEY=api.anthropic.com`

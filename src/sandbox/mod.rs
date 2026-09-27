@@ -1486,6 +1486,15 @@ fn prepare_seatbelt_config(config: &Config) -> Result<Config, String> {
 /// filtered mode. Linux bind-mounts its Unix socket into the sandbox;
 /// macOS points its seatbelt endpoint rule and the child env at its
 /// loopback TCP port.
+/// Transparent egress plumbing for one launch (Linux): the fds bwrap
+/// reports on and blocks on, and the resolv.conf naming the fake resolver.
+#[derive(Clone, Copy)]
+pub struct TransparentFds<'a> {
+    pub info_fd: std::os::fd::RawFd,
+    pub block_fd: std::os::fd::RawFd,
+    pub resolv: &'a Path,
+}
+
 pub fn build(
     guard: &SandboxGuard,
     config: &Config,
@@ -1493,6 +1502,7 @@ pub fn build(
     verbose: bool,
     sandbox_tty: Option<&Path>,
     proxy: Option<&crate::proxy::Proxy>,
+    transparent: Option<TransparentFds<'_>>,
 ) -> Result<Command, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1503,11 +1513,12 @@ pub fn build(
             project_dir,
             verbose,
             proxy.and_then(|p| p.unix_path()),
+            transparent,
         )
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = guard;
+        let _ = (guard, transparent);
         let prepared = prepare_seatbelt_config(config)?;
         Ok(seatbelt::build(
             &prepared,
