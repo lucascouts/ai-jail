@@ -3100,15 +3100,17 @@ fn extra_mounts_with_check(
         let Some(spec) = MapSpec::parse_validated(encoded, "read-write") else {
             continue;
         };
-        // Overlap must be rejected in BOTH directions: an RW child
-        // under an RO destination would be shadowed read-only (the
-        // original check), and an RW parent over an RO destination
-        // would silently re-expose the read-only subtree as writable
-        // because the later RW bind wins in bwrap's mount order.
-        if trusted_ro_destinations.iter().any(|ro| {
-            spec.destination.starts_with(ro)
-                || ro.starts_with(&spec.destination)
-        }) {
+        // An RW map at or under an RO destination is rejected: the RO
+        // map is a policy boundary, and nothing beneath it may become
+        // writable. An RW map strictly ABOVE an RO destination is kept:
+        // mounts are ordered parent-first below, so the RO child is
+        // bound after (and on top of) the RW parent and stays read-only
+        // -- the sandbox holds no capabilities and seccomp denies every
+        // mount syscall, so it cannot be unmounted from inside.
+        if trusted_ro_destinations
+            .iter()
+            .any(|ro| spec.destination.starts_with(ro))
+        {
             output::security_warn(
                 "ignoring rw-map that overlaps a read-only map destination",
             );
@@ -3127,6 +3129,10 @@ fn extra_mounts_with_check(
         }
     }
 
+    // Parent before child: bwrap gives the later mount precedence, so a
+    // nested map must come after the map that contains it. Stable, so
+    // unrelated maps keep their given order.
+    mounts.sort_by_key(|m| m.dest().components().count());
     mounts
 }
 
@@ -4456,28 +4462,51 @@ mod tests {
     }
 
     #[test]
-    fn extra_mounts_rw_parent_shadowing_ro_child_is_rejected() {
-        // The reverse overlap: an RW map of a PARENT directory would
-        // be mounted after the RO child (rw maps are emitted last),
-        // and bwrap's later mount wins — silently re-exposing the
-        // read-only subtree as writable. Must be rejected in both
-        // directions.
+    fn extra_mounts_rw_parent_keeps_ro_child_on_top() {
+        // The reverse overlap: an RW map of a PARENT directory. bwrap's
+        // later mount wins, so the RW parent must be emitted FIRST and
+        // the RO child after it -- the child then stays read-only
+        // inside a writable parent. Emitting the parent last would
+        // silently re-expose the read-only subtree as writable.
         let ro = vec![PathBuf::from("/data/keys")];
         let rw = vec![PathBuf::from("/data")];
         let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
-        assert_eq!(
-            mounts.len(),
-            1,
-            "rw parent must be dropped, keeping only the ro child"
-        );
+        assert_eq!(mounts.len(), 2, "both maps are kept");
         assert!(matches!(
             &mounts[0],
+            Mount::Bind { dest, .. } if dest == Path::new("/data")
+        ));
+        assert!(matches!(
+            &mounts[1],
             Mount::RoBind { src, dest }
                 if src == Path::new("/data/keys")
                     && dest == Path::new("/data/keys")
         ));
 
-        // Component boundaries matter: /data-keys is NOT under /data.
+        // An RW map of the SAME path as an RO map is still rejected:
+        // the RO map is the boundary.
+        let rw = vec![PathBuf::from("/data/keys")];
+        let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
+        assert_eq!(mounts.len(), 1);
+        assert!(matches!(&mounts[0], Mount::RoBind { .. }));
+
+        // Several RO children under one RW parent, given in any order,
+        // all land after it.
+        let ro = vec![PathBuf::from("/data/a/deep"), PathBuf::from("/data/b")];
+        let rw = vec![PathBuf::from("/data")];
+        let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
+        let dests: Vec<_> = mounts.iter().map(Mount::dest).collect();
+        assert_eq!(
+            dests,
+            vec![
+                Path::new("/data"),
+                Path::new("/data/b"),
+                Path::new("/data/a/deep")
+            ]
+        );
+
+        // Component boundaries matter: /data-keys is NOT under /data/keys.
+        let ro = vec![PathBuf::from("/data/keys")];
         let rw = vec![PathBuf::from("/data-keys")];
         let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
         assert_eq!(mounts.len(), 2);

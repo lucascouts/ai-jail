@@ -116,7 +116,7 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 16. SSH agent socket and `~/.ssh` exemption mounts
 17. Pictures mount
 18. Browser profile state mount
-19. Extra user mounts (`--map`, `--rw-map`)
+19. Extra user mounts (`--map`, `--rw-map`; sorted parent-first by destination depth, so a read-only map strictly inside a read-write map lands on top of it)
 20. Overlay maps (`--overlay-map` — copy-on-write `--overlay-src`/`--overlay`)
 21. Project directory (pwd, rw or ro depending on mode)
 22. In-project user mounts (after the project bind)
