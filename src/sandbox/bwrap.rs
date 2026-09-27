@@ -3144,6 +3144,138 @@ fn create_safe_overlay_dirs(paths: &[&Path]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Overlay storage held by one launch (Linux). overlayfs leaves scratch
+/// entries -- whiteout devices, rename temporaries -- in `work/work`,
+/// which the kernel creates with mode 000, so a plain `rm -rf` of the
+/// project's `.ai-jail-overlays` fails once anything was deleted or
+/// renamed through an overlay. `work/` is scratch by definition: the
+/// kernel recreates what it needs on the next mount. `upper/` holds the
+/// captured changes and is never touched.
+///
+/// Two launches in one project share the storage, and cleaning `work/`
+/// under a live mount would break it. So every launch holds a shared
+/// `flock` on each layer's `.lock` for its lifetime, and on drop cleans a
+/// layer's `work/` only if it can take the lock exclusively -- that is,
+/// when no other launch is still using it.
+pub(crate) struct OverlaySession {
+    layers: Vec<(PathBuf, std::fs::File)>,
+}
+
+impl OverlaySession {
+    /// Take a shared lock on every layer under `<project>/.ai-jail-overlays`.
+    /// Best-effort: a layer whose lock cannot be opened is simply not
+    /// cleaned later. No storage, no locks.
+    pub(crate) fn acquire(project_dir: &Path) -> OverlaySession {
+        let mut layers = Vec::new();
+        for base in overlay_layer_dirs(project_dir) {
+            if let Some(lock) = open_layer_lock(&base)
+                && lock.lock_shared().is_ok()
+            {
+                layers.push((base, lock));
+            }
+        }
+        OverlaySession { layers }
+    }
+}
+
+impl Drop for OverlaySession {
+    fn drop(&mut self) {
+        for (base, lock) in self.layers.drain(..) {
+            // Release our shared lock first, then compete for exclusive
+            // on a fresh descriptor: flock locks belong to the open file
+            // description, so re-locking `lock` would just convert it.
+            drop(lock);
+            let Some(exclusive) = open_layer_lock(&base) else {
+                continue;
+            };
+            if exclusive.try_lock().is_ok() {
+                clear_overlay_work(&base.join("work"));
+            }
+        }
+    }
+}
+
+/// Layer directories (`<storage>/<name>`) that exist right now. Never
+/// follows symlinks: the storage is host-writable state inside the
+/// project.
+fn overlay_layer_dirs(project_dir: &Path) -> Vec<PathBuf> {
+    let root = project_dir.join(OVERLAY_STORAGE_DIR);
+    let Ok(meta) = root.symlink_metadata() else {
+        return vec![];
+    };
+    if !meta.is_dir() {
+        return vec![];
+    }
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return vec![];
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.symlink_metadata()
+                .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+        })
+        .collect()
+}
+
+/// Open (creating) `<layer>/.lock` without following a symlink there.
+fn open_layer_lock(base: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(base.join(".lock"))
+        .ok()
+}
+
+/// Empty an overlay `work/` directory, keeping the directory itself.
+/// Directories inside are made owner-accessible first (overlayfs creates
+/// `work/work` as mode 000); symlinks are removed, never followed.
+fn clear_overlay_work(work: &Path) {
+    if !work
+        .symlink_metadata()
+        .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+    {
+        return;
+    }
+    make_dirs_owner_accessible(work);
+    if let Ok(entries) = std::fs::read_dir(work) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let is_dir = path
+                .symlink_metadata()
+                .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink());
+            let _ = if is_dir {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+        }
+    }
+}
+
+fn make_dirs_owner_accessible(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ =
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path
+                .symlink_metadata()
+                .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+            {
+                make_dirs_owner_accessible(&path);
+            }
+        }
+    }
+}
+
 /// Write a `.gitignore` into the overlay storage root so the layers
 /// are never accidentally committed. Best-effort; failure is silent.
 fn write_overlay_gitignore(storage_root: &Path) {
@@ -5223,6 +5355,90 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+
+    /// A project dir with one overlay layer whose work/ holds what the
+    /// kernel leaves behind: a mode-000 `work/work` with an entry inside.
+    fn overlay_layer_fixture(name: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let project = std::env::temp_dir()
+            .join(format!("ai-jail-ovl-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&project);
+        let base = project.join(OVERLAY_STORAGE_DIR).join("layer");
+        let scratch = base.join("work/work");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(base.join("upper")).unwrap();
+        std::fs::write(base.join("upper/kept"), "captured").unwrap();
+        std::fs::write(scratch.join("#2551"), "").unwrap();
+        std::fs::set_permissions(
+            &scratch,
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        (project, base)
+    }
+
+    fn remove_fixture(project: &Path) {
+        make_dirs_owner_accessible(project);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn clear_overlay_work_empties_mode_000_scratch_and_keeps_upper() {
+        let (project, base) = overlay_layer_fixture("clear");
+        clear_overlay_work(&base.join("work"));
+        let left: Vec<_> =
+            std::fs::read_dir(base.join("work")).unwrap().collect();
+        let upper = std::fs::read_to_string(base.join("upper/kept"));
+        remove_fixture(&project);
+        assert!(left.is_empty(), "work/ not emptied");
+        assert_eq!(upper.unwrap(), "captured");
+    }
+
+    #[test]
+    fn clear_overlay_work_never_follows_a_symlink() {
+        let (project, base) = overlay_layer_fixture("symlink");
+        let outside = project.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("precious"), "keep").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("work/link")).unwrap();
+        clear_overlay_work(&base.join("work"));
+        let kept = std::fs::read_to_string(outside.join("precious"));
+        let link_gone = base.join("work/link").symlink_metadata().is_err();
+        remove_fixture(&project);
+        assert_eq!(kept.unwrap(), "keep");
+        assert!(link_gone);
+    }
+
+    #[test]
+    fn overlay_session_cleans_only_when_last_one_out() {
+        let (project, base) = overlay_layer_fixture("session");
+        let first = OverlaySession::acquire(&project);
+        let second = OverlaySession::acquire(&project);
+        assert_eq!(first.layers.len(), 1);
+        // The first launch exits while the second still uses the layer:
+        // its scratch must survive.
+        drop(first);
+        let during = base.join("work/work").symlink_metadata().is_ok();
+        // The last launch out cleans.
+        drop(second);
+        let after: Vec<_> =
+            std::fs::read_dir(base.join("work")).unwrap().collect();
+        remove_fixture(&project);
+        assert!(during, "cleaned under a live launch");
+        assert!(after.is_empty(), "last launch did not clean");
+    }
+
+    #[test]
+    fn overlay_session_without_storage_is_a_no_op() {
+        let project = std::env::temp_dir()
+            .join(format!("ai-jail-ovl-none-{}", std::process::id()));
+        std::fs::create_dir_all(&project).unwrap();
+        let session = OverlaySession::acquire(&project);
+        let empty = session.layers.is_empty();
+        drop(session);
+        let _ = std::fs::remove_dir_all(&project);
+        assert!(empty);
     }
 
     #[test]

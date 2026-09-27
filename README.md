@@ -425,7 +425,9 @@ Linux uses namespace isolation and, where available, Landlock, seccomp, and
 resource limits. macOS has no global filesystem reads, network, or host IPC by
 default; `--agent-state` and other state mounts work on both platforms.
 Overlay maps are copy-on-write on Linux only; on macOS they are honored as
-read-only maps. `sandbox-exec` is deprecated and neither backend protects
+read-only maps. Captured changes stay in `<project>/.ai-jail-overlays/*/upper`;
+the kernel's scratch in `work/` is cleared when the last launch using it
+exits, so the storage can be removed with a plain `rm -rf`. `sandbox-exec` is deprecated and neither backend protects
 against kernel/driver vulnerabilities, terminal emulator vulnerabilities, or
 all IPC and side-channel classes. For truly hostile workloads, use a
 disposable VM.

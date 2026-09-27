@@ -742,6 +742,13 @@ fn run() -> Result<i32, String> {
         egress_proxy.as_ref(),
     )?;
 
+    // Overlay storage exists once build() has run. Hold it for the
+    // launch; on drop (every exit path) the kernel's scratch in each
+    // layer's work/ is cleared unless another launch still uses it.
+    #[cfg(target_os = "linux")]
+    let _overlay_session =
+        sandbox::bwrap::OverlaySession::acquire(&project_dir);
+
     // Apply NOFILE and CORE limits on the parent (inherited by child
     // across fork+exec). NPROC is applied inside the sandbox instead
     // — see run_landlock_exec() — to avoid EAGAIN during bwrap's
