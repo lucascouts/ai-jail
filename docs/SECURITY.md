@@ -77,6 +77,12 @@ settable per command in `~/.ai-jail`). Use
 
 ## Platform notes and residual risks
 
+A `--map` nested as a direct child of a `--rw-map` is kept read-only by its
+bind mount alone: Landlock grants are additive, so the parent's write rule
+also covers the child. The mount itself is locked in the sandbox's
+namespaces and cannot be undone from inside. Deeper, missing or symlinked
+children refuse the writable parent instead (see the README).
+
 Linux combines bubblewrap namespaces with Landlock, seccomp, and resource
 limits where available. Seccomp denies raw and packet sockets, with one
 narrow exception: `socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE)`, which
