@@ -1164,17 +1164,6 @@ fn prepare_seatbelt_config(config: &Config) -> Result<Config, String> {
     Ok(prepared)
 }
 
-/// Build the sandbox command.
-///
-/// `sandbox_tty` is the device the child will use as its terminal, when
-/// ai-jail is proxying a PTY. macOS scopes its terminal `file-ioctl` grant to
-/// that exact device; Linux does not need it, because seccomp denies TIOCSTI
-/// outright there.
-///
-/// `proxy` is the running filtered-egress proxy, when the launch is in
-/// filtered mode. Linux bind-mounts its Unix socket into the sandbox;
-/// macOS points its seatbelt endpoint rule and the child env at its
-/// loopback TCP port.
 /// Transparent egress plumbing for one launch (Linux): the fds bwrap
 /// reports on and blocks on, and the resolv.conf naming the fake resolver.
 #[derive(Clone, Copy)]
@@ -1193,6 +1182,17 @@ pub struct LaunchExtras<'a> {
     pub transparent: Option<TransparentFds<'a>>,
 }
 
+/// Build the sandbox command.
+///
+/// `sandbox_tty` is the device the child will use as its terminal, when
+/// ai-jail is proxying a PTY. macOS scopes its terminal `file-ioctl` grant to
+/// that exact device; Linux does not need it, because seccomp denies TIOCSTI
+/// outright there.
+///
+/// `proxy` is the running filtered-egress proxy, when the launch is in
+/// filtered mode. Linux bind-mounts its Unix socket into the sandbox;
+/// macOS points its seatbelt endpoint rule and the child env at its
+/// loopback TCP port.
 pub fn build(
     guard: &SandboxGuard,
     config: &Config,
