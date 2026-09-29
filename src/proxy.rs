@@ -905,9 +905,13 @@ pub(crate) const BRIDGE_READY_ENV: &str = "AI_JAIL_BRIDGE_READY";
 pub(crate) fn run_bridge(port: u16, socket: &Path) -> Result<(), String> {
     // Test-only (tests/port_forward.rs): hold the bind back so a spawner
     // that does not wait for readiness loses the race every time. Never
-    // documented; it can only slow the sandbox's own bridge down.
+    // documented, and honoured only by bridges whose spawner waits for
+    // them (a `--forward-port` bridge): it can only delay the launch, never
+    // leave the proxy bridge unbound while the agent runs.
+    let wait_ready = std::env::var_os(BRIDGE_READY_ENV).is_some();
     if let Some(ms) = std::env::var("AI_JAIL_TEST_BRIDGE_DELAY_MS")
         .ok()
+        .filter(|_| wait_ready)
         .and_then(|v| v.parse::<u64>().ok())
     {
         thread::sleep(Duration::from_millis(ms.min(5_000)));
@@ -917,7 +921,7 @@ pub(crate) fn run_bridge(port: u16, socket: &Path) -> Result<(), String> {
     // A spawner that waits for the port (a `--forward-port` bridge) sets
     // this and pipes stdout; the proxy bridge inherits the agent's stdout
     // and must never write to it.
-    if std::env::var_os(BRIDGE_READY_ENV).is_some() {
+    if wait_ready {
         let mut out = io::stdout();
         out.write_all(b"ready\n")
             .and_then(|()| out.flush())
@@ -997,14 +1001,7 @@ impl PortForward {
         )?;
         let active = Arc::new(AtomicUsize::new(0));
         thread::spawn(move || {
-            for client in listener.incoming() {
-                let client = match client {
-                    Ok(client) => client,
-                    Err(_) => {
-                        thread::sleep(Duration::from_millis(50));
-                        continue;
-                    }
-                };
+            for client in accepted(listener.incoming()) {
                 if active.fetch_add(1, Ordering::SeqCst)
                     >= MAX_FORWARD_CONNECTIONS
                 {
