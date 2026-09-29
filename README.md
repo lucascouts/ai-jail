@@ -241,14 +241,21 @@ read-only map inside it could not hold:
 
 - the child is deeper than one level (an ordinary directory above it could
   be renamed away, taking the protected subtree with it);
-- the child does not exist at launch (it would never be mounted);
+- the child, or its mount point under the writable map, does not exist at
+  launch (it would never be mounted, or bwrap would create the mount point
+  on the host);
 - the child is a symlink on the host (bwrap would follow it);
 - the `--rw-map` is at or under a `--map` destination (a read-only map is a
   policy boundary).
 
 The protection is per destination, not per file: another writable route to
 the same host file bypasses it — a hardlink that already existed, the same
-source mapped writable elsewhere, or the project directory. It also covers
+source mapped writable elsewhere, or the project directory. And any
+read-only map that sits two or more levels inside a writable area — the
+project directory or another `--rw-map` — can be moved away whole by
+renaming a directory above it, after which the agent recreates the path
+writable. That holds for every `--map`, nested or not; only a map one level
+below a writable root (whose root is itself a mount point) is anchored. It also covers
 only the paths you name. For Claude Code in particular, a later unjailed
 session also runs what `~/.claude.json` (`mcpServers`) and
 `~/.claude/plugins` define, so holes in `~/.claude` are not a complete

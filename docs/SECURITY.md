@@ -80,7 +80,11 @@ A `--map` nested as a direct child of a `--rw-map` is kept read-only by its
 bind mount alone: Landlock grants are additive, so the parent's write rule
 also covers the child. The mount itself is locked in the sandbox's
 namespaces and cannot be undone from inside. Deeper, missing or symlinked
-children refuse the writable parent instead (see the README).
+children refuse the writable parent instead (see the README). More generally,
+any `--map` two or more levels inside a writable area (the project directory
+or a `--rw-map`) can be moved away by renaming an ordinary directory above it,
+and its path recreated writable; the bind mount protects the files, not the
+path they are reached by.
 
 Linux combines bubblewrap namespaces with Landlock, seccomp, and resource
 limits where available. Seccomp denies raw and packet sockets, with one
