@@ -92,6 +92,27 @@ impl ProxyConfig {
     }
 }
 
+/// Pause after a failed accept before trying again.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Accepted connections from a listener, surviving failed accepts. A
+/// failed accept is transient -- EMFILE/ENFILE until descriptors free up,
+/// ECONNABORTED for a client that gave up -- so it is skipped after a short
+/// pause, never treated as the end of the listener: `map_while(Result::ok)`
+/// ended the loop there, and the proxy or bridge then refused every
+/// connection for the rest of the launch.
+fn accepted<T>(
+    incoming: impl Iterator<Item = io::Result<T>>,
+) -> impl Iterator<Item = T> {
+    incoming.filter_map(|conn| match conn {
+        Ok(conn) => Some(conn),
+        Err(_) => {
+            thread::sleep(ACCEPT_BACKOFF);
+            None
+        }
+    })
+}
+
 /// Running proxy handle. Reports where the listeners are; see the
 /// module docs for the (process-exit) lifecycle.
 pub(crate) struct Proxy {
@@ -116,7 +137,7 @@ impl Proxy {
 
         let tcp_shared = Arc::clone(&shared);
         thread::spawn(move || {
-            for stream in listener.incoming().map_while(Result::ok) {
+            for stream in accepted(listener.incoming()) {
                 let shared = Arc::clone(&tcp_shared);
                 thread::spawn(move || handle_conn(stream, shared));
             }
@@ -132,7 +153,7 @@ impl Proxy {
             )?;
             let unix_shared = Arc::clone(&shared);
             thread::spawn(move || {
-                for stream in unix_listener.incoming().map_while(Result::ok) {
+                for stream in accepted(unix_listener.incoming()) {
                     let shared = Arc::clone(&unix_shared);
                     thread::spawn(move || handle_conn(stream, shared));
                 }
@@ -902,7 +923,7 @@ pub(crate) fn run_bridge(port: u16, socket: &Path) -> Result<(), String> {
             .and_then(|()| out.flush())
             .map_err(|e| format!("bridge cannot report readiness: {e}"))?;
     }
-    for client in listener.incoming().map_while(Result::ok) {
+    for client in accepted(listener.incoming()) {
         let socket = socket.to_path_buf();
         thread::spawn(move || {
             if let Ok(upstream) = UnixStream::connect(&socket) {

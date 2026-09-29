@@ -387,3 +387,34 @@ fn filtered_egress_bridge_does_not_outlive_sandbox() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[test]
+fn filtered_egress_bridge_survives_descriptor_exhaustion() {
+    require_bwrap_net!();
+    require_lockdown_tools!("bash", "python3");
+    // Under --lockdown NOFILE is 4096: flood the in-sandbox bridge until
+    // accepts start failing, release everything, and connect again. A
+    // failed accept used to end the bridge's accept loop for good, so
+    // every later connection was refused for the rest of the launch.
+    let script = "python3 -c '
+import socket, time
+held = []
+try:
+    while len(held) < 20000:
+        held.append(socket.create_connection((\"127.0.0.1\", 15919), timeout=2))
+except OSError:
+    pass
+for s in held:
+    s.close()
+time.sleep(1)
+socket.create_connection((\"127.0.0.1\", 15919), timeout=5).close()
+print(\"ALIVE after\", len(held))
+'";
+    let output = filtered_run_locked(&["example.invalid"], &[], script, true);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("ALIVE"),
+        "bridge did not survive: stdout={stdout:?} stderr={stderr:?}"
+    );
+}
