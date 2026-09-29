@@ -51,7 +51,7 @@ fn probe(
     ro_children: &[&str],
     probes: &[(&str, &str)],
 ) -> String {
-    let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut script = String::new();
     for (label, cmd) in probes {
         script.push_str(&format!(
@@ -136,7 +136,7 @@ fn rw_map_under_ro_map_is_still_refused() {
         return;
     }
     let (root, state) = fixture("boundary");
-    let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let output = Command::new(ai_jail())
         .args(["--clean", "--no-status-bar", "--exec", "--no-save-config"])
         .arg("--map")
@@ -155,5 +155,118 @@ fn rw_map_under_ro_map_is_still_refused() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stdout.trim(), "blocked");
-    assert!(stderr.contains("overlaps a read-only map"), "{stderr}");
+    assert!(stderr.contains("at or under a read-only map"), "{stderr}");
+}
+
+/// Files under `root` modified after `since` -- the host-side truth, since
+/// a refused map leaves the agent writing into the sandbox's own tmpfs.
+fn changed_on_host(root: &Path, since: std::time::SystemTime) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let Ok(meta) = path.symlink_metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path.clone());
+            }
+            if meta.modified().is_ok_and(|m| m > since) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn attack(
+    name: &str,
+    setup: impl Fn(&Path),
+    maps: &[(&str, &str)],
+    script: &str,
+) -> (Vec<PathBuf>, String) {
+    let (root, state) = fixture(name);
+    std::fs::remove_dir_all(state.join("hooks")).unwrap();
+    setup(&state);
+    let since = std::time::SystemTime::now();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut command = Command::new(ai_jail());
+    command.args(["--clean", "--no-status-bar", "--exec", "--no-save-config"]);
+    for (flag, rel) in maps {
+        command.arg(flag).arg(if rel.is_empty() {
+            state.clone()
+        } else {
+            state.join(rel)
+        });
+    }
+    let output = command
+        .current_dir(root.join("project"))
+        .env("S", &state)
+        .args(["--env", "S", "sh", "-c", script])
+        .output()
+        .expect("failed to spawn ai-jail");
+    let changed = changed_on_host(&state, since);
+    let _ = std::fs::remove_dir_all(&root);
+    (
+        changed,
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+#[test]
+fn missing_ro_child_refuses_the_rw_parent() {
+    if !bwrap_available() {
+        eprintln!("SKIPPED: bwrap unavailable");
+        return;
+    }
+    // hooks/ does not exist at launch: it must not become writable.
+    let (changed, _) = attack(
+        "missing",
+        |_| {},
+        &[("--rw-map", ""), ("--map", "hooks")],
+        "mkdir \"$S/hooks\"; echo evil > \"$S/hooks/p\"; echo x > \"$S/x\"",
+    );
+    assert!(changed.is_empty(), "host changed: {changed:?}");
+}
+
+#[test]
+fn renaming_an_intermediate_dir_cannot_expose_a_deep_ro_child() {
+    if !bwrap_available() {
+        eprintln!("SKIPPED: bwrap unavailable");
+        return;
+    }
+    let (changed, _) = attack(
+        "deep",
+        |s| {
+            std::fs::create_dir_all(s.join("a/b")).unwrap();
+            std::fs::write(s.join("a/b/h.sh"), "orig\n").unwrap();
+        },
+        &[("--rw-map", ""), ("--map", "a/b")],
+        "mv \"$S/a\" \"$S/a2\"; mkdir -p \"$S/a/b\"; echo evil > \"$S/a/b/h.sh\"",
+    );
+    assert!(changed.is_empty(), "host changed: {changed:?}");
+}
+
+#[test]
+fn symlinked_ro_child_refuses_the_rw_parent() {
+    if !bwrap_available() {
+        eprintln!("SKIPPED: bwrap unavailable");
+        return;
+    }
+    let (changed, stdout) = attack(
+        "symlink",
+        |s| {
+            std::fs::create_dir_all(s.join("real")).unwrap();
+            std::os::unix::fs::symlink(s.join("real"), s.join("hooks"))
+                .unwrap();
+        },
+        &[("--rw-map", ""), ("--map", "hooks")],
+        "echo evil > \"$S/real/p\"; echo x > \"$S/x\"; echo RAN",
+    );
+    // The launch must go ahead with the parent refused -- not abort in
+    // bwrap on the symlinked mount point, which also writes nothing.
+    assert!(stdout.contains("RAN"), "agent did not run: {stdout:?}");
+    assert!(changed.is_empty(), "host changed: {changed:?}");
 }

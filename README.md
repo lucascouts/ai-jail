@@ -397,20 +397,37 @@ unlike the session directory, it persists between runs. Use a map or
 
 ### Read-only holes in a writable map
 
-A `--map` strictly inside a `--rw-map` stays read-only (Linux): maps are
-mounted parent-first, so the read-only child sits on top of the writable
-parent, and the sandbox can neither unmount it (no capabilities, and seccomp
-denies every mount syscall) nor rename or delete it (it is a mount point).
-That lets agent state stay writable while the files a *later, unjailed*
-session would execute do not:
+A `--map` that is a **direct child** of a `--rw-map` stays read-only on
+Linux: maps are mounted parent-first, so the read-only child sits on top of
+the writable parent. The kernel locks that mount in the sandbox's
+namespaces, so it can be neither unmounted nor remounted from inside (this
+holds even with `--no-seccomp --no-landlock`), and as a mount point it can
+be neither renamed nor deleted.
 
 ```bash
-ai-jail --rw-map ~/.claude --rw-map ~/.claude.json \
-  --map ~/.claude/hooks --map ~/.claude/settings.json claude
+ai-jail --rw-map ~/.agent-state --map ~/.agent-state/hooks \
+  --map ~/.agent-state/settings.json my-agent
 ```
 
-The reverse is refused with a warning: a `--rw-map` at or under a `--map`
-destination is dropped, because a read-only map is a policy boundary.
+The writable parent is refused with a warning, as before, whenever a
+read-only map inside it could not hold:
+
+- the child is deeper than one level (an ordinary directory above it could
+  be renamed away, taking the protected subtree with it);
+- the child does not exist at launch (it would never be mounted);
+- the child is a symlink on the host (bwrap would follow it);
+- the `--rw-map` is at or under a `--map` destination (a read-only map is a
+  policy boundary).
+
+The protection is per destination, not per file: another writable route to
+the same host file bypasses it — a hardlink that already existed, the same
+source mapped writable elsewhere, or the project directory. It also covers
+only the paths you name. For Claude Code in particular, a later unjailed
+session also runs what `~/.claude.json` (`mcpServers`) and
+`~/.claude/plugins` define, so holes in `~/.claude` are not a complete
+boundary: `--claude-dir` with a separate directory is. For the `claude`
+command itself, `--agent-state` plus `--map` already gives read-only holes
+without this rule.
 
 ## Browsers
 
