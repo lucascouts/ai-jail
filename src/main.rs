@@ -7,6 +7,7 @@ mod cli;
 mod command;
 mod config;
 mod fsutil;
+mod limits;
 mod output;
 mod proxy;
 mod pty;
@@ -159,6 +160,33 @@ fn test_extra_roots() -> Vec<rustls::pki_types::CertificateDer<'static>> {
 /// `--allow-tcp-port` stays dead (the filtered-egress proxy is the
 /// strictly better answer, docs/connect-proxy-plan.md), and filtered
 /// egress combines with neither unrestricted network nor browser mode.
+/// Resolve and check the resource limits before anything is launched.
+/// Every refusal here is a limit the user asked for and would not get.
+fn validate_resource_limits(
+    config: &config::Config,
+) -> Result<limits::ResourceLimits, String> {
+    let limits = limits::ResourceLimits::from_config(config)?;
+    #[cfg(not(target_os = "linux"))]
+    if !limits.is_empty() {
+        return Err(
+            "--memory, --max-tasks, --cpu-quota and --cpus are Linux only"
+                .into(),
+        );
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(cpus) = &limits.cpus {
+        // Affinity alone is advisory: any process may widen its own.
+        // Seccomp is what makes --cpus a limit rather than a hint.
+        if !config.seccomp_enabled() {
+            return Err("--cpus needs seccomp, which stops the sandbox \
+                        from widening its own CPU set; drop --no-seccomp"
+                .into());
+        }
+        limits::validate_cpus(cpus)?;
+    }
+    Ok(limits)
+}
+
 fn validate_network_flags(config: &config::Config) -> Result<(), String> {
     if !config.allow_tcp_ports().is_empty() {
         return Err("--allow-tcp-port is disabled (UDP cannot be isolated); use --allow-host for filtered egress instead".into());
@@ -264,6 +292,20 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
         &cli.landlock_rw_paths,
         cli.verbose,
     )?;
+
+    // --memory: the supervisor sits in the same cgroup and must outlive
+    // an OOM kill to report it, so the sandbox volunteers as the victim.
+    #[cfg(target_os = "linux")]
+    if config.memory_max.is_some() {
+        limits::prefer_sandbox_as_oom_victim();
+    }
+
+    // --cpus: pin this process (and so the command it becomes) before
+    // seccomp below refuses sched_setaffinity for good.
+    #[cfg(target_os = "linux")]
+    if let Some(cpus) = config.cpus.as_deref() {
+        limits::apply_cpus(&limits::parse_cpu_list(cpus)?)?;
+    }
 
     // Apply seccomp filter after Landlock (reduces kernel syscall
     // surface). Must happen before exec so the user command inherits
@@ -498,6 +540,7 @@ fn run() -> Result<i32, String> {
     config::absolutize_user_paths(&mut config, &invocation_cwd);
     apply_browser_profile(&mut config);
     validate_network_flags(&config)?;
+    let resource_limits = validate_resource_limits(&config)?;
 
     // Handle status command
     if cli.status {
@@ -532,6 +575,16 @@ fn run() -> Result<i32, String> {
     if cli.bootstrap {
         bootstrap::run(cli.verbose, config.claude_dir.as_deref())?;
         return Ok(0);
+    }
+
+    // Whole-sandbox limits need a cgroup: re-exec through a systemd
+    // user scope (this call does not return on the way in), then prove
+    // on the way back that the limits are really enforced. Placed
+    // before any thread, socket or temp file exists, so the hop leaves
+    // nothing behind; everything after this line runs once, inside.
+    #[cfg(target_os = "linux")]
+    if resource_limits.needs_scope() && !cli.dry_run {
+        limits::enter_scope(&resource_limits, cli.verbose)?;
     }
 
     // --env-from-file (phase 6 of docs/connect-proxy-plan.md): validated
@@ -639,6 +692,23 @@ fn run() -> Result<i32, String> {
 
     // Handle dry run
     if cli.dry_run {
+        if resource_limits.needs_scope() {
+            output::info(&format!(
+                "Resource limits: {} (via systemd-run --user --scope {})",
+                resource_limits.describe(),
+                resource_limits
+                    .scope_properties()
+                    .iter()
+                    .map(|p| format!("-p {p}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        } else if !resource_limits.is_empty() {
+            output::info(&format!(
+                "Resource limits: {}",
+                resource_limits.describe()
+            ));
+        }
         let formatted = sandbox::dry_run(
             &guard,
             &config,
@@ -823,6 +893,26 @@ fn run() -> Result<i32, String> {
         code
     };
 
+    // Read what the sandbox's cgroup counted while the scope still
+    // exists (this process keeps it alive), and explain a death the
+    // exit code alone cannot -- also under --exec, where a harness
+    // otherwise sees only "137".
+    #[cfg(target_os = "linux")]
+    let cgroup_report = if resource_limits.needs_scope() {
+        limits::own_cgroup_dir().map(|dir| limits::CgroupReport::read(&dir))
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let cgroup_report: Option<limits::CgroupReport> = None;
+    if let Some(msg) = limits::describe_exit(
+        exit_code,
+        &resource_limits,
+        cgroup_report.as_ref(),
+    ) {
+        output::error(&msg);
+    }
+
     // Append the launch record only now: exit code and duration are
     // what make it an audit trail rather than a log of intentions.
     if let Some(log) = &audit_log {
@@ -850,6 +940,9 @@ fn run() -> Result<i32, String> {
             global_config: home.join(".ai-jail").exists(),
             exit_code,
             duration: launch_start.elapsed(),
+            limits: (!resource_limits.is_empty())
+                .then(|| resource_limits.to_json()),
+            cgroup: cgroup_report.as_ref().map(limits::CgroupReport::to_json),
         }));
     }
 

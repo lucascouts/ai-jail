@@ -293,6 +293,24 @@ pub struct Config {
     /// never enable it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_log: Option<bool>,
+    /// Memory ceiling for the whole sandbox (`8G`, `512M`), enforced by
+    /// a systemd user scope with swap pinned to zero. Linux only. The
+    /// project `.ai-jail` may only lower it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_max: Option<String>,
+    /// Ceiling on processes *and threads* in the whole sandbox
+    /// (cgroup `pids.max`). The project `.ai-jail` may only lower it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tasks: Option<u64>,
+    /// CPU time for the whole sandbox, in percent of one CPU (400 =
+    /// four CPUs). The project `.ai-jail` may only lower it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_quota: Option<u32>,
+    /// CPUs the sandbox may run on (`8,24`, `0-3`), applied as CPU
+    /// affinity and locked by seccomp. The project `.ai-jail` may only
+    /// narrow it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -889,6 +907,10 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(inherit_env);
     take!(update_check);
     take!(audit_log);
+    take!(memory_max);
+    take!(max_tasks);
+    take!(cpu_quota);
+    take!(cpus);
     c.env_pass.extend(local.env_pass);
     dedup_strings(&mut c.env_pass);
     c.env_from_file.extend(local.env_from_file);
@@ -1234,6 +1256,36 @@ pub fn merge_with_global_report(
     monotonic!(update_check, |config: &Config| config
         .update_check_enabled());
     monotonic!(audit_log, |config: &Config| config.audit_log_enabled());
+    // Resource limits: a project may add or lower one, never raise it.
+    let weakens = |field: &str| {
+        format!(
+            "project .ai-jail {field} ignored because it weakens the baseline sandbox"
+        )
+    };
+    let (memory_max, dropped) =
+        crate::limits::tighten_size(c.memory_max.take(), local.memory_max);
+    c.memory_max = memory_max;
+    if dropped {
+        warnings.push(weakens("memory_max"));
+    }
+    let (max_tasks, dropped) =
+        crate::limits::tighten_number(c.max_tasks, local.max_tasks);
+    c.max_tasks = max_tasks;
+    if dropped {
+        warnings.push(weakens("max_tasks"));
+    }
+    let (cpu_quota, dropped) =
+        crate::limits::tighten_number(c.cpu_quota, local.cpu_quota);
+    c.cpu_quota = cpu_quota;
+    if dropped {
+        warnings.push(weakens("cpu_quota"));
+    }
+    let (cpus, dropped) =
+        crate::limits::tighten_cpus(c.cpus.take(), local.cpus);
+    c.cpus = cpus;
+    if dropped {
+        warnings.push(weakens("cpus"));
+    }
     if !local.env_pass.is_empty() {
         warnings.push(
             "project .ai-jail env_pass ignored (use --env or global config)"
@@ -1717,6 +1769,10 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     invert!(rlimits, no_rlimits);
     invert!(status_bar, no_status_bar);
     clone_into!(status_bar_style);
+    clone_into!(memory_max);
+    direct!(max_tasks);
+    direct!(cpu_quota);
+    clone_into!(cpus);
 
     config
         .allow_tcp_ports
@@ -1859,6 +1915,13 @@ pub fn display_status(config: &Config) {
     print_auto_tristate("  Landlock", config.no_landlock);
     print_auto_tristate("  Seccomp", config.no_seccomp);
     print_auto_tristate("  Rlimits", config.no_rlimits);
+    match crate::limits::ResourceLimits::from_config(config) {
+        Ok(limits) if !limits.is_empty() => {
+            output::status_header("  Limits", &limits.describe());
+        }
+        Ok(_) => {}
+        Err(e) => output::status_header("  Limits", &format!("invalid: {e}")),
+    }
     print_shared_or_hidden("  systemd --user", config.systemd_user);
     print_auto_tristate("  Lockdown", config.lockdown.map(|v| !v));
     print_allow_tcp_ports(&config.allow_tcp_ports, config.lockdown_enabled());
@@ -3031,6 +3094,119 @@ mask = []
     }
 
     #[test]
+    fn regression_v2_2_1_config_without_resource_limits() {
+        // Configs written before the resource limits existed must parse
+        // with every limit unset, which keeps the launch unscoped.
+        let toml = r#"
+command = ["claude"]
+rw_maps = ["/tmp/rw"]
+allow_hosts = ["anthropic.com"]
+audit_log = true
+no_rlimits = false
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.memory_max, None);
+        assert_eq!(cfg.max_tasks, None);
+        assert_eq!(cfg.cpu_quota, None);
+        assert_eq!(cfg.cpus, None);
+        assert!(
+            crate::limits::ResourceLimits::from_config(&cfg)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resource_limits_round_trip_through_toml() {
+        let toml = r#"
+memory_max = "8G"
+max_tasks = 2000
+cpu_quota = 400
+cpus = "8,24"
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.memory_max.as_deref(), Some("8G"));
+        assert_eq!(cfg.max_tasks, Some(2000));
+        assert_eq!(cfg.cpu_quota, Some(400));
+        assert_eq!(cfg.cpus.as_deref(), Some("8,24"));
+        let written = toml::to_string(&cfg).unwrap();
+        assert_eq!(parse_toml(&written).unwrap().cpus, cfg.cpus);
+        assert!(
+            !toml::to_string(&Config::default())
+                .unwrap()
+                .contains("memory_max")
+        );
+    }
+
+    #[test]
+    fn project_resource_limits_only_tighten() {
+        let project = Path::new("/project");
+        let baseline = Config {
+            memory_max: Some("8G".into()),
+            max_tasks: Some(2000),
+            cpu_quota: Some(400),
+            cpus: Some("0-7".into()),
+            ..Config::default()
+        };
+        let tighter = Config {
+            memory_max: Some("4G".into()),
+            max_tasks: Some(100),
+            cpu_quota: Some(100),
+            cpus: Some("2-3".into()),
+            ..Config::default()
+        };
+        let (c, warnings) =
+            merge_with_global_report(baseline.clone(), tighter, project);
+        assert_eq!(c.memory_max.as_deref(), Some("4G"));
+        assert_eq!(c.max_tasks, Some(100));
+        assert_eq!(c.cpu_quota, Some(100));
+        assert_eq!(c.cpus.as_deref(), Some("2-3"));
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let looser = Config {
+            memory_max: Some("64G".into()),
+            max_tasks: Some(99999),
+            cpu_quota: Some(3200),
+            cpus: Some("16-31".into()),
+            ..Config::default()
+        };
+        let (c, warnings) = merge_with_global_report(baseline, looser, project);
+        assert_eq!(c.memory_max.as_deref(), Some("8G"));
+        assert_eq!(c.max_tasks, Some(2000));
+        assert_eq!(c.cpu_quota, Some(400));
+        assert_eq!(c.cpus.as_deref(), Some("0-7"));
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+
+        // A project may add a limit the baseline did not set.
+        let (c, _) = merge_with_global_report(
+            Config::default(),
+            Config {
+                memory_max: Some("2G".into()),
+                ..Config::default()
+            },
+            project,
+        );
+        assert_eq!(c.memory_max.as_deref(), Some("2G"));
+    }
+
+    #[test]
+    fn malformed_project_limit_fails_closed() {
+        let project = Path::new("/project");
+        let (c, _) = merge_with_global_report(
+            Config {
+                memory_max: Some("8G".into()),
+                ..Config::default()
+            },
+            Config {
+                memory_max: Some("lots".into()),
+                ..Config::default()
+            },
+            project,
+        );
+        assert!(crate::limits::ResourceLimits::from_config(&c).is_err());
+    }
+
+    #[test]
     fn regression_old_config_without_deny_paths() {
         let toml = r#"
 command = ["claude"]
@@ -3182,6 +3358,10 @@ no_gpu = true
             trust_project_config: vec![],
             update_check: Some(false),
             audit_log: Some(true),
+            memory_max: Some("8G".into()),
+            max_tasks: Some(2000),
+            cpu_quota: Some(400),
+            cpus: Some("0-3,8".into()),
         };
         let serialized = serialize_config(&config).unwrap();
         let deserialized = parse_toml(&serialized).unwrap();
@@ -3229,6 +3409,10 @@ no_gpu = true
         assert!(deserialized.secret_hosts.is_empty());
         assert_eq!(deserialized.update_check, config.update_check);
         assert_eq!(deserialized.audit_log, config.audit_log);
+        assert_eq!(deserialized.memory_max, config.memory_max);
+        assert_eq!(deserialized.max_tasks, config.max_tasks);
+        assert_eq!(deserialized.cpu_quota, config.cpu_quota);
+        assert_eq!(deserialized.cpus, config.cpus);
     }
 
     #[test]
@@ -5609,6 +5793,10 @@ hide_dotdirs = [".my_secrets"]
             trust_project_config: vec![],
             update_check: None,
             audit_log: None,
+            memory_max: None,
+            max_tasks: None,
+            cpu_quota: None,
+            cpus: None,
         };
         save(&config);
 
