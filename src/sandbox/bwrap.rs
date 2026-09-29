@@ -2921,24 +2921,65 @@ fn extra_mounts_with_check(
     ro_maps: &[PathBuf],
     path_exists: impl Fn(&Path) -> bool,
 ) -> Vec<Mount> {
+    extra_mounts_with_checks(rw_maps, ro_maps, path_exists, |path| {
+        path.symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+    })
+}
+
+/// Why a read-only map strictly inside a read-write map cannot be kept on
+/// top of it, or `None` when it can. Only a *direct* child holds: its only
+/// ancestors inside the writable parent are the parent's mount root and
+/// the child itself, both mount points, which the sandbox can neither
+/// rename nor unmount. A deeper child sits under an ordinary directory
+/// the agent can rename, taking the protected subtree with it (measured:
+/// `mv S/a S/a2; mkdir -p S/a/b` made `S/a/b` writable again). A child
+/// that does not exist is never mounted at all, and a symlinked one is
+/// followed by bwrap to wherever it points.
+fn nested_ro_refusal(
+    parent: &MapSpec,
+    child: &MapSpec,
+    child_mounted: bool,
+    is_symlink: &impl Fn(&Path) -> bool,
+) -> Option<&'static str> {
+    let rel = child.destination.strip_prefix(&parent.destination).ok()?;
+    if rel.components().count() != 1 {
+        return Some("it is not a direct child");
+    }
+    if !child_mounted {
+        return Some("it does not exist");
+    }
+    if is_symlink(&parent.source.join(rel)) {
+        return Some("it is a symlink");
+    }
+    None
+}
+
+/// [`extra_mounts`] with injectable path-existence and symlink predicates.
+fn extra_mounts_with_checks(
+    rw_maps: &[PathBuf],
+    ro_maps: &[PathBuf],
+    path_exists: impl Fn(&Path) -> bool,
+    is_symlink: impl Fn(&Path) -> bool,
+) -> Vec<Mount> {
     let mut mounts = Vec::new();
 
-    let trusted_ro_destinations: Vec<PathBuf> = ro_maps
+    // Every requested read-only map, and whether it will be mounted: a
+    // request whose source is missing is still a policy boundary.
+    let requested_ro: Vec<(MapSpec, bool)> = ro_maps
         .iter()
         .filter_map(|encoded| MapSpec::parse_validated(encoded, "read-only"))
-        .map(|spec| spec.destination)
+        .map(|spec| {
+            let mounted = path_exists(&spec.source);
+            (spec, mounted)
+        })
         .collect();
 
-    // Read-only destinations are policy boundaries: no RW map may shadow
-    // them or a subtree beneath them.
-    for encoded in ro_maps {
-        let Some(spec) = MapSpec::parse_validated(encoded, "read-only") else {
-            continue;
-        };
-        if path_exists(&spec.source) {
+    for (spec, mounted) in &requested_ro {
+        if *mounted {
             mounts.push(Mount::RoBind {
-                src: spec.source,
-                dest: spec.destination,
+                src: spec.source.clone(),
+                dest: spec.destination.clone(),
             });
         } else {
             output::warn(&format!(
@@ -2948,25 +2989,43 @@ fn extra_mounts_with_check(
         }
     }
 
-    for encoded in rw_maps {
+    'rw: for encoded in rw_maps {
         let Some(spec) = MapSpec::parse_validated(encoded, "read-write") else {
             continue;
         };
         // An RW map at or under an RO destination is rejected: the RO
         // map is a policy boundary, and nothing beneath it may become
-        // writable. An RW map strictly ABOVE an RO destination is kept:
-        // mounts are ordered parent-first below, so the RO child is
-        // bound after (and on top of) the RW parent and stays read-only
-        // -- the sandbox holds no capabilities and seccomp denies every
-        // mount syscall, so it cannot be unmounted from inside.
-        if trusted_ro_destinations
+        // writable.
+        if requested_ro
             .iter()
-            .any(|ro| spec.destination.starts_with(ro))
+            .any(|(ro, _)| spec.destination.starts_with(&ro.destination))
         {
             output::security_warn(
-                "ignoring rw-map that overlaps a read-only map destination",
+                "ignoring rw-map at or under a read-only map destination",
             );
             continue;
+        }
+        // An RW map strictly ABOVE an RO destination is kept only when the
+        // RO map can hold on top of it (see nested_ro_refusal): mounts are
+        // ordered parent-first below, so the RO child is bound after the
+        // RW parent. Otherwise the parent is refused, as before nesting
+        // was supported -- a silently writable subtree is the one outcome
+        // this must never produce.
+        for (ro, mounted) in &requested_ro {
+            if !ro.destination.starts_with(&spec.destination) {
+                continue;
+            }
+            if let Some(why) =
+                nested_ro_refusal(&spec, ro, *mounted, &is_symlink)
+            {
+                output::security_warn(&format!(
+                    "ignoring rw-map {}: the read-only map {} inside it \
+                     cannot be kept read-only ({why})",
+                    spec.destination.display(),
+                    ro.destination.display()
+                ));
+                continue 'rw;
+            }
         }
         if path_exists(&spec.source) {
             mounts.push(Mount::Bind {
@@ -4228,8 +4287,8 @@ mod tests {
     fn extra_mounts_rw_child_overrides_ro_parent() {
         // Inject |_| true so the test is hermetic: it doesn't require
         // /usr or /usr/bin to exist on the host (they won't in the Nix
-        // build sandbox). The ordering guarantee — ro first, rw after —
-        // is the invariant under test, not path existence.
+        // build sandbox). The invariant under test: an RW map under an
+        // RO destination is dropped, and the RO parent survives.
         let ro = vec![PathBuf::from("/usr")];
         let rw = vec![PathBuf::from("/usr/bin")];
         let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
@@ -4245,53 +4304,83 @@ mod tests {
 
     #[test]
     fn extra_mounts_rw_parent_keeps_ro_child_on_top() {
-        // The reverse overlap: an RW map of a PARENT directory. bwrap's
-        // later mount wins, so the RW parent must be emitted FIRST and
-        // the RO child after it -- the child then stays read-only
-        // inside a writable parent. Emitting the parent last would
-        // silently re-expose the read-only subtree as writable.
-        let ro = vec![PathBuf::from("/data/keys")];
+        // An RW map of a PARENT directory with an RO direct child. bwrap's
+        // later mount wins, so the RW parent must be emitted FIRST and the
+        // RO child after it -- the child then stays read-only inside a
+        // writable parent. Emitting the parent last would silently
+        // re-expose the read-only subtree as writable.
+        let ro = vec![PathBuf::from("/data/keys"), PathBuf::from("/data/cfg")];
         let rw = vec![PathBuf::from("/data")];
-        let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
-        assert_eq!(mounts.len(), 2, "both maps are kept");
-        assert!(matches!(
-            &mounts[0],
-            Mount::Bind { dest, .. } if dest == Path::new("/data")
-        ));
-        assert!(matches!(
-            &mounts[1],
-            Mount::RoBind { src, dest }
-                if src == Path::new("/data/keys")
-                    && dest == Path::new("/data/keys")
-        ));
-
-        // An RW map of the SAME path as an RO map is still rejected:
-        // the RO map is the boundary.
-        let rw = vec![PathBuf::from("/data/keys")];
-        let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
-        assert_eq!(mounts.len(), 1);
-        assert!(matches!(&mounts[0], Mount::RoBind { .. }));
-
-        // Several RO children under one RW parent, given in any order,
-        // all land after it.
-        let ro = vec![PathBuf::from("/data/a/deep"), PathBuf::from("/data/b")];
-        let rw = vec![PathBuf::from("/data")];
-        let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
+        let mounts = extra_mounts_with_checks(&rw, &ro, |_| true, |_| false);
         let dests: Vec<_> = mounts.iter().map(Mount::dest).collect();
         assert_eq!(
             dests,
             vec![
                 Path::new("/data"),
-                Path::new("/data/b"),
-                Path::new("/data/a/deep")
+                Path::new("/data/keys"),
+                Path::new("/data/cfg")
             ]
         );
+        assert!(matches!(&mounts[0], Mount::Bind { .. }));
+        assert!(matches!(&mounts[1], Mount::RoBind { .. }));
+
+        // An RW map of the SAME path as an RO map is still rejected: the
+        // RO map is the boundary.
+        let ro = vec![PathBuf::from("/data/keys")];
+        let rw = vec![PathBuf::from("/data/keys")];
+        let mounts = extra_mounts_with_checks(&rw, &ro, |_| true, |_| false);
+        assert_eq!(mounts.len(), 1);
+        assert!(matches!(&mounts[0], Mount::RoBind { .. }));
 
         // Component boundaries matter: /data-keys is NOT under /data/keys.
-        let ro = vec![PathBuf::from("/data/keys")];
         let rw = vec![PathBuf::from("/data-keys")];
-        let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
+        let mounts = extra_mounts_with_checks(&rw, &ro, |_| true, |_| false);
         assert_eq!(mounts.len(), 2);
+    }
+
+    #[test]
+    fn extra_mounts_refuse_rw_parent_when_ro_child_cannot_hold() {
+        let rw = vec![PathBuf::from("/data")];
+        let only_rw = |mounts: &[Mount]| {
+            !mounts
+                .iter()
+                .any(|m| matches!(m, Mount::Bind { dest, .. } if dest == Path::new("/data")))
+        };
+        // Deeper than a direct child: an intermediate directory could be
+        // renamed away with the protected subtree inside it.
+        let ro = vec![PathBuf::from("/data/a/deep")];
+        let mounts = extra_mounts_with_checks(&rw, &ro, |_| true, |_| false);
+        assert!(only_rw(&mounts), "deep child must refuse the RW parent");
+        // A child that does not exist is never mounted: fail closed.
+        let ro = vec![PathBuf::from("/data/hooks")];
+        let mounts = extra_mounts_with_checks(
+            &rw,
+            &ro,
+            |p| p != Path::new("/data/hooks"),
+            |_| false,
+        );
+        assert!(only_rw(&mounts), "missing child must refuse the RW parent");
+        // A symlinked child would be followed by bwrap.
+        let mounts = extra_mounts_with_checks(
+            &rw,
+            &ro,
+            |_| true,
+            |p| p == Path::new("/data/hooks"),
+        );
+        assert!(
+            only_rw(&mounts),
+            "symlinked child must refuse the RW parent"
+        );
+        // The symlink is checked where it lives on the host: under the RW
+        // parent's SOURCE, not its destination.
+        let rw = vec![PathBuf::from("/host/state:/data")];
+        let mounts = extra_mounts_with_checks(
+            &rw,
+            &ro,
+            |_| true,
+            |p| p == Path::new("/host/state/hooks"),
+        );
+        assert!(only_rw(&mounts), "symlink under the source must refuse");
     }
 
     #[test]

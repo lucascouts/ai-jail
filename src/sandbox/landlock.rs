@@ -408,7 +408,10 @@ fn collect_lockdown_paths(
 /// mount namespace hides paths not explicitly bind-mounted. The
 /// two layers are complementary — Landlock prevents writes to
 /// ro-bind-mounted paths, bwrap prevents access to unmounted
-/// paths.
+/// paths. One exception: a read-only map nested directly inside a
+/// read-write map inherits the parent's write grant (Landlock rules
+/// only add access), so there the read-only bind mount alone keeps it
+/// read-only.
 fn collect_normal_paths_with_mounted_paths(
     config: &Config,
     project_dir: &Path,
