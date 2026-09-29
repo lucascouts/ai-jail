@@ -98,6 +98,9 @@ OPTIONS:
     --forward-port <PORT>          Expose the host's 127.0.0.1:PORT on the sandbox's own
                                    loopback (repeatable; cannot combine with --network;
                                    the service behind PORT is reachable in full)
+    --transparent-egress / --no-transparent-egress
+                                   Also route clients that ignore HTTPS_PROXY through
+                                   the --allow-host proxy (Linux; default: off)
     --claude-dir <PATH>            Use PATH as Claude config dir (sets CLAUDE_CONFIG_DIR)
     --clean                        Ignore project .ai-jail config, start fresh
     --dry-run                      Print the sandbox command without executing
@@ -147,6 +150,10 @@ pub struct CliArgs {
     pub allow_tcp_ports: Vec<u16>,
     pub allow_hosts: Vec<String>,
     pub forward_ports: Vec<u16>,
+    pub transparent_egress: Option<bool>,
+    /// Internal mode: (sandbox pid, proxy socket, ports). The allowlist
+    /// arrives as the positional arguments.
+    pub transparent_helper: Option<(u32, PathBuf, Vec<u16>)>,
     pub claude_dir: Option<PathBuf>,
     pub agent_state: Option<bool>,
     pub inherit_env: Option<bool>,
@@ -304,6 +311,28 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     .parse()
                     .map_err(|_| format!("invalid port number: {port_text}"))?;
                 args.forward_ports.push(port);
+            }
+            Long(s @ ("transparent-egress" | "no-transparent-egress")) => {
+                args.transparent_egress = Some(s == "transparent-egress");
+            }
+            Long("transparent-helper") => {
+                let pid_text = parser.value().map_err(|e| e.to_string())?;
+                let pid_text = pid_text.to_string_lossy();
+                let pid: u32 = pid_text
+                    .parse()
+                    .map_err(|_| format!("invalid sandbox pid: {pid_text}"))?;
+                let sock: PathBuf =
+                    parser.value().map_err(|e| e.to_string())?.into();
+                let ports_text = parser.value().map_err(|e| e.to_string())?;
+                let ports = ports_text
+                    .to_string_lossy()
+                    .split(',')
+                    .map(|p| {
+                        p.parse::<u16>()
+                            .map_err(|_| format!("invalid helper port: {p}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                args.transparent_helper = Some((pid, sock, ports));
             }
             Long("claude-dir") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -601,6 +630,8 @@ fn is_sandbox_long_flag(arg: &str) -> bool {
             | "--agent-state"
             | "--no-agent-state"
             | "--forward-port"
+            | "--transparent-egress"
+            | "--no-transparent-egress"
             | "--inherit-env"
             | "--no-inherit-env"
             | "--update-check"
@@ -1464,6 +1495,46 @@ mod tests {
         assert!(parse_test(&["--forward-port", "70000", "bash"]).is_err());
         assert!(parse_test(&["--forward-port", "http", "bash"]).is_err());
         assert!(parse_test(&["--forward-port"]).is_err());
+    }
+
+    #[test]
+    fn parse_transparent_egress_pair() {
+        let on = parse_test(&["--transparent-egress", "bash"]).unwrap();
+        assert_eq!(on.transparent_egress, Some(true));
+        let off = parse_test(&["--no-transparent-egress", "bash"]).unwrap();
+        assert_eq!(off.transparent_egress, Some(false));
+        assert!(
+            parse_test(&["bash", "--transparent-egress"]).is_err(),
+            "a sandbox flag after the command must be refused"
+        );
+    }
+
+    #[test]
+    fn parse_transparent_helper_internal_mode() {
+        let args = parse_test(&[
+            "--transparent-helper",
+            "4242",
+            "/tmp/p.sock",
+            "80,443",
+            "api.anthropic.com",
+            "laratranslate.com",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.transparent_helper,
+            Some((4242, PathBuf::from("/tmp/p.sock"), vec![80, 443]))
+        );
+        assert_eq!(
+            args.command,
+            vec!["api.anthropic.com", "laratranslate.com"]
+        );
+        assert!(
+            parse_test(&["--transparent-helper", "x", "/s", "443"]).is_err()
+        );
+        assert!(
+            parse_test(&["--transparent-helper", "1", "/s", "443,http"])
+                .is_err()
+        );
     }
 
     #[test]

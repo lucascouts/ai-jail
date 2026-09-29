@@ -436,6 +436,20 @@ struct MountSources<'a> {
 }
 
 impl<'a> MountSources<'a> {
+    /// Transparent egress: keep every resolv.conf destination the guard
+    /// computed (including a symlink's intermediate hop) but mount `src`
+    /// there instead. Without a host resolv.conf, bind the standard path.
+    fn with_resolv_source(mut self, src: &'a Path) -> Self {
+        self.resolv_mount = Some((
+            src,
+            self.resolv_mount
+                .map_or(Path::new("/etc/resolv.conf"), |(_, dest)| dest),
+        ));
+        self.resolv_intermediate_mount =
+            self.resolv_intermediate_mount.map(|(_, dest)| (src, dest));
+        self
+    }
+
     fn from_guard(guard: &'a SandboxGuard) -> Self {
         Self {
             hosts_mount: guard.hosts_mount(),
@@ -1284,8 +1298,12 @@ pub fn build(
     verbose: bool,
     proxy_socket: Option<&Path>,
     forward_sockets: &[(u16, PathBuf)],
+    transparent: Option<super::TransparentFds<'_>>,
 ) -> Result<Command, String> {
-    let sources = MountSources::from_guard(guard);
+    let mut sources = MountSources::from_guard(guard);
+    if let Some(t) = &transparent {
+        sources = sources.with_resolv_source(t.resolv);
+    }
     let mount_set =
         discover_mounts_full(config, project_dir, &sources, verbose)?;
     let map_args = mounted_map_args(
@@ -1300,6 +1318,30 @@ pub fn build(
     let wrapper = resolve_landlock_wrapper(config)?;
 
     let mut cmd = Command::new(bwrap);
+
+    // Transparent egress: bwrap reports the sandbox pid on the info fd
+    // and holds the agent back until the block fd is written, so the
+    // supervisor-side helper can bind inside the sandbox's netns first.
+    // Both fds are close-on-exec in the supervisor; only this child
+    // inherits them.
+    if let Some(t) = &transparent {
+        use std::os::unix::process::CommandExt;
+        cmd.args(["--info-fd", &t.info_fd.to_string()]);
+        cmd.args(["--block-fd", &t.block_fd.to_string()]);
+        let (info_fd, block_fd) = (t.info_fd, t.block_fd);
+        // SAFETY: only async-signal-safe fcntl(2) calls between fork and
+        // exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                for fd in [info_fd, block_fd] {
+                    if nix::libc::fcntl(fd, nix::libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
 
     for arg in mount_set.all_mount_args() {
         cmd.arg(arg);
@@ -4130,6 +4172,40 @@ mod tests {
                 .iter()
                 .any(|arg| arg.contains("ai-jail-proxy-test")
                     && arg != &sock_src)
+        );
+    }
+
+    #[test]
+    fn transparent_resolv_keeps_destinations_and_swaps_the_source() {
+        let hosts = (Path::new("/tmp/h"), Path::new("/etc/hosts"));
+        let empty = Path::new("/tmp/empty");
+        let ours = Path::new("/tmp/ai-jail-resolv.test");
+        // A symlinked resolv.conf: both the target and the intermediate
+        // hop keep their destinations; both now mount our file.
+        let mut sources = MountSources::legacy(
+            hosts,
+            Some((
+                Path::new("/tmp/host-resolv"),
+                Path::new("/run/r/resolv.conf"),
+            )),
+            empty,
+        );
+        sources.resolv_intermediate_mount =
+            Some((Path::new("/tmp/host-resolv"), Path::new("/run/hop")));
+        let swapped = sources.with_resolv_source(ours);
+        assert_eq!(
+            swapped.resolv_mount,
+            Some((ours, Path::new("/run/r/resolv.conf")))
+        );
+        assert_eq!(
+            swapped.resolv_intermediate_mount,
+            Some((ours, Path::new("/run/hop")))
+        );
+        // No host resolv.conf at all: bind ours at the standard path.
+        let bare = MountSources::legacy(hosts, None, empty);
+        assert_eq!(
+            bare.with_resolv_source(ours).resolv_mount,
+            Some((ours, Path::new("/etc/resolv.conf")))
         );
     }
 
