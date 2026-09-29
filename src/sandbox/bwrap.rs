@@ -3057,13 +3057,17 @@ fn git_worktree_mounts(
 }
 
 fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
-    extra_mounts_with_check(rw_maps, ro_maps, super::path_exists)
+    extra_mounts_with_checks(rw_maps, ro_maps, super::path_exists, |path| {
+        path.symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+    })
 }
 
 /// Inner implementation of [`extra_mounts`] that accepts an injectable
 /// path-existence predicate. This makes the logic unit-testable in hermetic
 /// environments (e.g. the Nix build sandbox) where host paths like `/usr`
 /// may not exist.
+#[cfg(test)]
 fn extra_mounts_with_check(
     rw_maps: &[PathBuf],
     ro_maps: &[PathBuf],
@@ -3088,6 +3092,7 @@ fn nested_ro_refusal(
     parent: &MapSpec,
     child: &MapSpec,
     child_mounted: bool,
+    path_exists: &impl Fn(&Path) -> bool,
     is_symlink: &impl Fn(&Path) -> bool,
 ) -> Option<&'static str> {
     let rel = child.destination.strip_prefix(&parent.destination).ok()?;
@@ -3095,7 +3100,12 @@ fn nested_ro_refusal(
         return Some("it is not a direct child");
     }
     if !child_mounted {
-        return Some("it does not exist");
+        return Some("its source does not exist");
+    }
+    // bwrap would create a missing mount point on the host, inside the
+    // writable parent, as a side effect of the launch.
+    if !path_exists(&parent.source.join(rel)) {
+        return Some("its mount point does not exist under the writable map");
     }
     if is_symlink(&parent.source.join(rel)) {
         return Some("it is a symlink");
@@ -3163,9 +3173,13 @@ fn extra_mounts_with_checks(
             if !ro.destination.starts_with(&spec.destination) {
                 continue;
             }
-            if let Some(why) =
-                nested_ro_refusal(&spec, ro, *mounted, &is_symlink)
-            {
+            if let Some(why) = nested_ro_refusal(
+                &spec,
+                ro,
+                *mounted,
+                &path_exists,
+                &is_symlink,
+            ) {
                 output::security_warn(&format!(
                     "ignoring rw-map {}: the read-only map {} inside it \
                      cannot be kept read-only ({why})",
@@ -4599,6 +4613,18 @@ mod tests {
             |p| p == Path::new("/host/state/hooks"),
         );
         assert!(only_rw(&mounts), "symlink under the source must refuse");
+        // A SOURCE:DEST child whose own source exists but whose mount point
+        // is missing under the writable map: bwrap would create it on the
+        // host, so the parent is refused instead.
+        let rw = vec![PathBuf::from("/data")];
+        let ro = vec![PathBuf::from("/elsewhere/cfg:/data/cfg")];
+        let mounts = extra_mounts_with_checks(
+            &rw,
+            &ro,
+            |p| p != Path::new("/data/cfg"),
+            |_| false,
+        );
+        assert!(only_rw(&mounts), "missing mount point must refuse");
     }
 
     #[test]
