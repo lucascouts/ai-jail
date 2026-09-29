@@ -196,7 +196,10 @@ with a private loopback address (`127.64.0.0/10`) and everything else with
 NXDOMAIN, and connections to those addresses on ports 80 and 443 become
 `CONNECT name:port` to the unchanged proxy. The allowlist, SSRF guard and
 DNS pinning stay on the host; nothing is resolved inside the sandbox, so
-there is no DNS channel out.
+it adds no DNS channel: the only lookups on the host are the proxy's, for
+allowlisted names, as for a proxy-aware client. The helper runs outside the
+sandbox but holds no capabilities and, where Landlock exists, no filesystem
+access once its ports are bound; it maps at most 65,536 names per launch.
 
 The resolver and listeners need privileged ports, which the agent must never
 hold, so they run in a supervisor-side helper that joins only the sandbox's

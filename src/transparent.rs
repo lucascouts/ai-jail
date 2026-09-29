@@ -11,7 +11,8 @@
 //!    there answers each *allowlisted* name with a unique address from
 //!    `127.64.0.0/10` and remembers the pair; everything else gets
 //!    NXDOMAIN. Nothing is ever resolved for real inside the sandbox, so
-//!    there is no DNS exfiltration channel.
+//!    this adds no DNS channel: the only lookups made on the host are the
+//!    proxy's, for allowlisted names, exactly as for a proxy-aware client.
 //! 2. Listeners on `0.0.0.0:<port>` (80 and 443) receive the connection the
 //!    client then makes to that fake address -- the whole of `127.0.0.0/8`
 //!    is local on loopback. `getsockname()` on the accepted socket yields
@@ -51,6 +52,12 @@ pub(crate) const RESOLV_CONF: &str = "nameserver 127.0.0.53\n";
 const FAKE_FIRST: u32 = 0x7F40_0001;
 const FAKE_END: u32 = 0x7F80_0000;
 
+/// Most names one launch will map. The table lives in the helper, outside
+/// the sandbox and beyond any limit on it, and every allowlist entry also
+/// covers its subdomains: uncapped, 2 M distinct subdomains took the helper
+/// to 1.15 GB. Past the cap new names get SERVFAIL; mapped names still work.
+const MAX_FAKE_NAMES: usize = 65_536;
+
 /// TTL on fake answers. Mappings live for the whole launch, so a long TTL
 /// is safe; it only spares the resolver repeat queries.
 const FAKE_TTL: u32 = 300;
@@ -69,6 +76,9 @@ impl FakeDns {
     pub(crate) fn addr_for(&mut self, name: &str) -> Option<Ipv4Addr> {
         if let Some(addr) = self.by_name.get(name) {
             return Some(*addr);
+        }
+        if self.by_name.len() >= MAX_FAKE_NAMES {
+            return None;
         }
         let raw = FAKE_FIRST.checked_add(self.next)?;
         if raw >= FAKE_END {
@@ -89,6 +99,7 @@ impl FakeDns {
 const TYPE_A: u16 = 1;
 const CLASS_IN: u16 = 1;
 const RCODE_FORMERR: u8 = 1;
+const RCODE_SERVFAIL: u8 = 2;
 const RCODE_NXDOMAIN: u8 = 3;
 const RCODE_NOTIMP: u8 = 4;
 
@@ -200,7 +211,14 @@ pub(crate) fn answer(
         return Some(out);
     }
     let addr = if q.qtype == TYPE_A {
-        table.lock().ok()?.addr_for(&q.name)
+        let addr = table.lock().ok()?.addr_for(&q.name);
+        if addr.is_none() {
+            // Table full: fail this name instead of growing without bound.
+            let mut out = header(q.id, q.rd, RCODE_SERVFAIL, 1, 0);
+            out.extend_from_slice(q.raw);
+            return Some(out);
+        }
+        addr
     } else {
         None
     };
@@ -247,7 +265,13 @@ fn serve_listener(
     proxy: PathBuf,
     table: Arc<Mutex<FakeDns>>,
 ) {
-    for client in listener.incoming().map_while(Result::ok) {
+    for client in listener.incoming() {
+        // A failed accept (EMFILE, ECONNABORTED) is transient: pause and go
+        // on, never end the listener for the rest of the launch.
+        let Ok(client) = client else {
+            thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        };
         let proxy = proxy.clone();
         let table = Arc::clone(&table);
         thread::spawn(move || {
@@ -277,6 +301,7 @@ fn serve_resolver(
     let mut buf = [0_u8; 512];
     loop {
         let Ok((n, peer)) = socket.recv_from(&mut buf) else {
+            thread::sleep(std::time::Duration::from_millis(50));
             continue;
         };
         if let Some(reply) = answer(&buf[..n], &allowlist, &table) {
@@ -383,6 +408,25 @@ fn drop_all_capabilities() -> Result<(), String> {
         inheritable: u32,
     }
     const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    // Bounding set first, while CAP_SETPCAP is still held. Unknown
+    // capability numbers above the kernel's last one return EINVAL; stop
+    // there.
+    for cap in 0..64 {
+        // SAFETY: prctl with integer arguments.
+        if unsafe { nix::libc::prctl(nix::libc::PR_CAPBSET_DROP, cap, 0, 0, 0) }
+            != 0
+        {
+            if io::Error::last_os_error().raw_os_error()
+                == Some(nix::libc::EINVAL)
+            {
+                break;
+            }
+            return Err(format!(
+                "cannot drop capability {cap} from the bounding set: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
     let mut header = CapHeader {
         version: LINUX_CAPABILITY_VERSION_3,
         pid: 0,
@@ -407,11 +451,30 @@ fn drop_all_capabilities() -> Result<(), String> {
             io::Error::last_os_error()
         ));
     }
-    // SAFETY: plain prctl calls with integer arguments.
-    unsafe {
-        nix::libc::prctl(nix::libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    // SAFETY: plain prctl call with integer arguments.
+    if unsafe { nix::libc::prctl(nix::libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }
+        != 0
+    {
+        return Err(format!(
+            "cannot set no_new_privs: {}",
+            io::Error::last_os_error()
+        ));
     }
     Ok(())
+}
+
+/// Deny the helper every filesystem access (Landlock, best effort). Once
+/// bound it only relays bytes, yet it parses input the sandbox controls
+/// while running as the user; this takes the user's files out of reach of
+/// any bug in that parsing. Connecting to the proxy's Unix socket by path
+/// is not a Landlock filesystem right, so the relay keeps working. A
+/// kernel without Landlock leaves the helper as it was.
+fn deny_filesystem() {
+    use landlock::{ABI, Access, AccessFs, Ruleset, RulesetAttr};
+    let _ = Ruleset::default()
+        .handle_access(AccessFs::from_all(ABI::V3))
+        .and_then(|r| r.create())
+        .and_then(|r| r.restrict_self());
 }
 
 /// Internal mode `--transparent-helper`: join the sandbox of `pid`, bind
@@ -433,6 +496,7 @@ pub(crate) fn run_helper(
         listeners.push(listener);
     }
     drop_all_capabilities()?;
+    deny_filesystem();
 
     let table = Arc::new(Mutex::new(FakeDns::default()));
     {
@@ -537,7 +601,13 @@ impl Transparent {
             let pid = match read_child_pid(info) {
                 Ok(pid) => pid,
                 Err(e) => {
-                    crate::output::warn(&format!("transparent egress: {e}"));
+                    // No pid, so nothing to kill: bwrap itself has failed
+                    // or died. Were the sandbox to start anyway it would be
+                    // plain filtered egress with no resolver -- no egress
+                    // for proxy-ignoring clients, never more than asked.
+                    crate::output::security_warn(&format!(
+                        "transparent egress: {e}"
+                    ));
                     return;
                 }
             };
@@ -550,7 +620,7 @@ impl Transparent {
                     let _ = block.write_all(b"1");
                 }
                 Err(e) => {
-                    crate::output::warn(&format!(
+                    crate::output::security_warn(&format!(
                         "transparent egress failed, stopping the sandbox: {e}"
                     ));
                     // SAFETY: kill(2) on the sandbox's init pid.
@@ -591,7 +661,14 @@ fn read_child_pid(mut info: io::PipeReader) -> Result<u32, String> {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&buf)
             && let Some(pid) = value.get("child-pid").and_then(|v| v.as_u64())
         {
-            return u32::try_from(pid).map_err(|_| "bad child pid".into());
+            // 0 would signal our own process group, and anything that does
+            // not fit a pid_t is not a pid.
+            return u32::try_from(pid)
+                .ok()
+                .filter(|&p| p > 1 && i32::try_from(p).is_ok())
+                .ok_or_else(|| {
+                    format!("bwrap reported an invalid pid: {pid}")
+                });
         }
     }
     Err("bwrap reported no sandbox pid".into())
@@ -618,9 +695,11 @@ fn start_helper(
                 .collect::<Vec<_>>()
                 .join(","),
         );
-    for host in allowlist {
-        command.arg(host);
-    }
+    // `--` ends the helper's options, and only hostname-shaped entries are
+    // passed at all: the resolver can only ever match `[A-Za-z0-9._-]`
+    // names, and an entry starting with `-` must never read as a flag.
+    command.arg("--");
+    command.args(helper_hosts(allowlist));
     let mut child = command
         .env(HELPER_MARKER, "1")
         .stdin(Stdio::piped())
@@ -641,6 +720,19 @@ fn start_helper(
         let _ = child.wait();
         Err("the helper did not come up".into())
     }
+}
+
+/// Allowlist entries worth passing to the helper: hostname-shaped ones.
+/// The resolver can only ever match `[A-Za-z0-9._-]` names, and an entry
+/// starting with `-` must never be read as one of the helper's flags.
+fn helper_hosts(allowlist: &[String]) -> impl Iterator<Item = &String> {
+    allowlist.iter().filter(|host| {
+        !host.is_empty()
+            && !host.starts_with('-')
+            && host.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')
+            })
+    })
 }
 
 /// Env marker the internal helper mode refuses to run without.
@@ -787,6 +879,44 @@ mod tests {
         for end in 0..full.len() {
             let _ = answer(&full[..end], &allowlist, &table);
         }
+    }
+
+    #[test]
+    fn helper_receives_only_hostname_shaped_entries() {
+        let allowlist = allow(&[
+            "api.anthropic.com",
+            "-x",
+            "--no-gpu",
+            "2606:4700::1111",
+            "93.184.216.34",
+            "under_score.example",
+            "",
+        ]);
+        let passed: Vec<_> = helper_hosts(&allowlist).collect();
+        assert_eq!(
+            passed,
+            vec!["api.anthropic.com", "93.184.216.34", "under_score.example"]
+        );
+    }
+
+    #[test]
+    fn name_table_is_capped_and_answers_servfail_past_it() {
+        let mut full = FakeDns::default();
+        for i in 0..MAX_FAKE_NAMES {
+            assert!(full.addr_for(&format!("n{i}.example.com")).is_some());
+        }
+        assert!(full.addr_for("one-more.example.com").is_none());
+        // Names mapped before the cap keep resolving.
+        assert!(full.addr_for("n7.example.com").is_some());
+        let table = Mutex::new(full);
+        let reply = answer(
+            &query(9, "fresh.example.com", TYPE_A),
+            &allow(&["example.com"]),
+            &table,
+        )
+        .unwrap();
+        assert_eq!(rcode(&reply), RCODE_SERVFAIL);
+        assert_eq!(answers(&reply), 0);
     }
 
     #[test]
