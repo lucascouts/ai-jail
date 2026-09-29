@@ -876,13 +876,6 @@ fn run() -> Result<i32, String> {
         },
     )?;
 
-    // Overlay storage exists once build() has run. Hold it for the
-    // launch; on drop (every exit path) the kernel's scratch in each
-    // layer's work/ is cleared unless another launch still uses it.
-    #[cfg(target_os = "linux")]
-    let _overlay_session =
-        sandbox::bwrap::OverlaySession::acquire(&project_dir);
-
     #[cfg(target_os = "linux")]
     if let Some(t) = transparent.as_mut() {
         let socket = egress_proxy
