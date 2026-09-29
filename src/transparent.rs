@@ -285,23 +285,86 @@ fn serve_resolver(
     }
 }
 
-/// Enter the user, then the network namespace of process `pid`. Must run
-/// while the process is still single-threaded: joining a user namespace
-/// is refused to a multi-threaded caller.
+/// `ioctl(2)` request returning the user namespace that owns a namespace fd
+/// (`NS_GET_USERNS`, linux/nsfs.h: `_IO(0xb7, 0x1)`).
+const NS_GET_USERNS: u64 = 0xb701;
+
+/// Join the network namespace of process `pid`, entering first the user
+/// namespace that *owns* it. Must run while the process is still
+/// single-threaded: joining a user namespace is refused to a
+/// multi-threaded caller.
+///
+/// The owner is asked of the kernel rather than read from
+/// `/proc/<pid>/ns/user`, because that path races: bwrap reports the pid,
+/// then moves the child into a nested user namespace of its own. Read
+/// after that move, `/proc/<pid>/ns/user` names the nested namespace,
+/// which has no authority over the network namespace (measured: 4 of 40
+/// launches failed with EPERM). The network namespace itself never
+/// changes, and neither does its owner.
 fn enter_namespaces(pid: u32) -> Result<(), String> {
     use nix::sched::{CloneFlags, setns};
-    for (ns, flag) in [
-        ("user", CloneFlags::CLONE_NEWUSER),
-        ("net", CloneFlags::CLONE_NEWNET),
-    ] {
-        let path = format!("/proc/{pid}/ns/{ns}");
-        let file = std::fs::File::open(&path)
-            .map_err(|e| format!("cannot open {path}: {e}"))?;
-        setns(&file, flag).map_err(|e| {
-            format!("cannot join the sandbox {ns} namespace: {e}")
-        })?;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::MetadataExt;
+
+    let path = format!("/proc/{pid}/ns/net");
+    let net = std::fs::File::open(&path)
+        .map_err(|e| format!("cannot open {path}: {e}"))?;
+    // Never bind on the host: a sandbox that somehow shares our network
+    // namespace is refused, not served.
+    let ours = std::fs::metadata("/proc/self/ns/net")
+        .map_err(|e| format!("cannot read our own net namespace: {e}"))?;
+    let theirs = net
+        .metadata()
+        .map_err(|e| format!("cannot stat {path}: {e}"))?;
+    if (theirs.dev(), theirs.ino()) == (ours.dev(), ours.ino()) {
+        return Err("the sandbox shares the host network namespace".into());
     }
+    // SAFETY: NS_GET_USERNS takes no argument and returns a new fd, which
+    // is immediately wrapped in an OwnedFd.
+    let raw = unsafe { nix::libc::ioctl(net.as_raw_fd(), NS_GET_USERNS as _) };
+    if raw < 0 {
+        return Err(format!(
+            "cannot find the owner of the sandbox net namespace: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `raw` is a fresh, valid fd owned by nothing else.
+    let owner = unsafe { OwnedFd::from_raw_fd(raw) };
+    setns(&owner, CloneFlags::CLONE_NEWUSER)
+        .map_err(|e| format!("cannot join the sandbox user namespace: {e}"))?;
+    setns(&net, CloneFlags::CLONE_NEWNET)
+        .map_err(|e| format!("cannot join the sandbox net namespace: {e}"))?;
     Ok(())
+}
+
+/// How long to wait for the sandbox's loopback to come up.
+const LOOPBACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bind the resolver on `127.0.0.53:53`, waiting for loopback. bwrap
+/// brings `lo` up in the child during setup, which runs concurrently with
+/// the helper joining the namespace: a helper that arrives first finds no
+/// 127.0.0.0/8 address yet and gets EADDRNOTAVAIL (measured: 2 of 60
+/// launches). bwrap does it before blocking on `--block-fd`, so the wait
+/// is bounded; bringing `lo` up here instead would race bwrap's own
+/// address setup. The listeners bind the wildcard address and need no wait.
+fn bind_resolver() -> Result<UdpSocket, String> {
+    let deadline = std::time::Instant::now() + LOOPBACK_WAIT;
+    loop {
+        match UdpSocket::bind((RESOLVER_ADDR, 53)) {
+            Ok(socket) => return Ok(socket),
+            Err(e)
+                if e.kind() == io::ErrorKind::AddrNotAvailable
+                    && std::time::Instant::now() < deadline =>
+            {
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "cannot bind the resolver on {RESOLVER_ADDR}:53: {e}"
+                ));
+            }
+        }
+    }
 }
 
 /// Drop every capability in every set and forbid regaining any. The helper
@@ -362,9 +425,7 @@ pub(crate) fn run_helper(
     allowlist: Vec<String>,
 ) -> Result<(), String> {
     enter_namespaces(pid)?;
-    let resolver = UdpSocket::bind((RESOLVER_ADDR, 53)).map_err(|e| {
-        format!("cannot bind the resolver on {RESOLVER_ADDR}:53: {e}")
-    })?;
+    let resolver = bind_resolver()?;
     let mut listeners = Vec::new();
     for &port in ports {
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
