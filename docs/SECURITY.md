@@ -130,7 +130,25 @@ there bought nothing — an agent with `--network` can learn the same addresses
 by connecting out — while breaking any tool that calls `getifaddrs()`. Every
 other netlink protocol and every other raw socket domain stays denied, and
 under `--lockdown` or without `--network` so does this one, so lockdown's
-`/sys/class/net` mask cannot be walked around. `BWRAP_BIN` must resolve canonically either to a
+`/sys/class/net` mask cannot be walked around.
+
+Resource limits (`--memory`, `--max-tasks`, `--cpu-quota`) are a cgroup the
+supervisor shares with the sandbox, obtained from the user's own systemd
+manager: they bound what a runaway or hostile agent can consume, and they are
+not an isolation boundary. The supervisor re-execs itself through
+`systemd-run`, found on `PATH`, and then verifies from `/proc/self/cgroup` and
+the cgroup's own files that it sits in the scope it named and that every
+requested limit is enforced; any mismatch refuses the launch, so a missing
+controller or a spoofed `AI_JAIL_LIMITS_SCOPE` marker can only stop a launch,
+never run one unlimited. The sandbox's `oom_score_adj` is raised so an OOM
+kill lands on the agent rather than the supervisor that reports it; an agent
+that lowers its own score back can at worst lose that report, not escape the
+limit. `--cpus` is CPU affinity locked by denying `sched_setaffinity` in
+seccomp; it bounds where the sandbox runs, not how much of each CPU it takes
+(that is `--cpu-quota`). `cpuset` isolation is not used because enabling it
+for an unprivileged user requires root.
+
+`BWRAP_BIN` must resolve canonically either to a
 root-owned executable with no group- or world-write bits, or to an executable
 with no write bits at all under a `/nix/store` that is itself owned by root
 (or by an unmapped owner, which a user namespace reports as the overflow uid)
