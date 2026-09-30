@@ -37,6 +37,14 @@ OPTIONS:
     --landlock / --no-landlock     Enable/disable Landlock LSM (Linux 5.13+, default: on)
     --seccomp / --no-seccomp       Enable/disable seccomp syscall filter (Linux, default: on)
     --rlimits / --no-rlimits       Enable/disable resource limits (default: on)
+    --memory <SIZE>                Cap the whole sandbox's memory (e.g. 8G, 512M;
+                                   swap off). Linux + systemd user session
+    --max-tasks <N>                Cap processes AND threads in the whole sandbox
+                                   (Linux + systemd user session)
+    --cpu-quota <PCT>              Cap CPU time, in percent of one CPU (400% = four
+                                   CPUs; Linux + systemd user session)
+    --cpus <LIST>                  Run only on these CPUs (e.g. 8,24 or 0-3); locked
+                                   by seccomp so the sandbox cannot widen it (Linux)
     --systemd-user / --no-systemd-user
                                    Expose host systemd --user bus (dangerous; default: off)
     --no-gpu / --gpu               Disable/enable GPU device passthrough (Linux only)
@@ -127,6 +135,11 @@ pub struct CliArgs {
     pub landlock: Option<bool>,
     pub seccomp: Option<bool>,
     pub rlimits: Option<bool>,
+    /// `--memory`: validated at parse time, stored as typed.
+    pub memory_max: Option<String>,
+    pub max_tasks: Option<u64>,
+    pub cpu_quota: Option<u32>,
+    pub cpus: Option<String>,
     pub systemd_user: Option<bool>,
     pub gpu: Option<bool>,
     pub docker: Option<bool>,
@@ -281,6 +294,37 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("rlimits" | "no-rlimits")) => {
                 args.rlimits = Some(s == "rlimits");
+            }
+            Long("memory") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let text = val.to_string_lossy().into_owned();
+                crate::limits::parse_size(&text)
+                    .map_err(|e| format!("--memory: {e}"))?;
+                args.memory_max = Some(text);
+            }
+            Long("max-tasks") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let text = val.to_string_lossy();
+                let n: u64 =
+                    text.parse().ok().filter(|&n| n > 0).ok_or_else(|| {
+                        format!("--max-tasks: invalid count {text:?}")
+                    })?;
+                args.max_tasks = Some(n);
+            }
+            Long("cpu-quota") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let pct = crate::limits::parse_percent(&val.to_string_lossy())
+                    .map_err(|e| format!("--cpu-quota: {e}"))?;
+                args.cpu_quota = Some(pct);
+            }
+            Long("cpus") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let text = val.to_string_lossy();
+                let set = crate::limits::parse_cpu_list(&text)
+                    .map_err(|e| format!("--cpus: {e}"))?;
+                // Stored normalized so saved configs and the inner
+                // wrapper see one canonical spelling.
+                args.cpus = Some(crate::limits::format_cpu_list(&set));
             }
             Long(s @ ("systemd-user" | "no-systemd-user")) => {
                 args.systemd_user = Some(s == "systemd-user");
@@ -596,6 +640,10 @@ fn is_sandbox_long_flag(arg: &str) -> bool {
             | "--no-seccomp"
             | "--rlimits"
             | "--no-rlimits"
+            | "--memory"
+            | "--max-tasks"
+            | "--cpu-quota"
+            | "--cpus"
             | "--ssh"
             | "--no-ssh"
             | "--pictures"
@@ -729,6 +777,48 @@ mod tests {
         let args = parse_test(&["--init", "claude"]).unwrap();
         assert!(args.init);
         assert_eq!(args.command, vec!["claude"]);
+    }
+
+    #[test]
+    fn parse_resource_limits() {
+        let args = parse_test(&[
+            "--memory",
+            "8G",
+            "--max-tasks",
+            "2000",
+            "--cpu-quota",
+            "400%",
+            "--cpus",
+            "3,0-1",
+            "claude",
+        ])
+        .unwrap();
+        assert_eq!(args.memory_max.as_deref(), Some("8G"));
+        assert_eq!(args.max_tasks, Some(2000));
+        assert_eq!(args.cpu_quota, Some(400));
+        assert_eq!(args.cpus.as_deref(), Some("0-1,3"), "normalized");
+        assert_eq!(args.command, vec!["claude"]);
+    }
+
+    #[test]
+    fn parse_resource_limits_rejects_bad_values_early() {
+        for bad in [
+            &["--memory", "lots"][..],
+            &["--memory", "100"],
+            &["--max-tasks", "0"],
+            &["--max-tasks", "-1"],
+            &["--cpu-quota", "0%"],
+            &["--cpus", "3-1"],
+            &["--cpus", "a"],
+        ] {
+            assert!(parse_test(bad).is_err(), "{bad:?} should fail");
+        }
+    }
+
+    #[test]
+    fn resource_limit_flags_after_command_are_recognized() {
+        assert!(is_sandbox_long_flag("--memory"));
+        assert!(is_sandbox_long_flag("--cpus=0-3"));
     }
 
     #[test]

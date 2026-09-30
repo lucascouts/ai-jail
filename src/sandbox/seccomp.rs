@@ -239,6 +239,13 @@ fn compile_filter(
             rules.insert(nr, vec![]);
         }
     }
+    // --cpus is applied as CPU affinity just before this filter; any
+    // process could otherwise widen its own set again (`taskset -p`).
+    // Reading the set (sched_getaffinity) stays allowed so nproc, make
+    // -j and runtimes size their parallelism to the CPUs they got.
+    if config.cpus.is_some() {
+        rules.insert(libc::SYS_sched_setaffinity, vec![]);
+    }
 
     // SeccompCondition::new compares Dword syscall arguments. MaskedEq(0xF)
     // matches SOCK_RAW despite SOCK_CLOEXEC or SOCK_NONBLOCK type flags.
@@ -447,6 +454,25 @@ mod tests {
              wrong lands here too: BPF compares 32-bit words, so a \
              sign-extended value could never match one"
         );
+    }
+
+    #[test]
+    fn cpus_lock_sched_setaffinity_only_when_set() {
+        // Without --cpus nothing inside is pinned, so nothing needs
+        // locking; with it, widening the set must be refused.
+        let nr = libc::SYS_sched_setaffinity as u64;
+        let compares = |config: &Config| {
+            let (bpf, _, count) = compile_filter(config).unwrap();
+            (bpf.iter().any(|insn| u64::from(insn.k) == nr), count)
+        };
+        let (plain, plain_count) = compares(&Config::default());
+        let (pinned, pinned_count) = compares(&Config {
+            cpus: Some("0".into()),
+            ..Config::default()
+        });
+        assert!(!plain, "sched_setaffinity denied without --cpus");
+        assert!(pinned, "sched_setaffinity not denied with --cpus");
+        assert_eq!(pinned_count, plain_count + 1);
     }
 
     #[test]
