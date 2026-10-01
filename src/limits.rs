@@ -575,8 +575,8 @@ fn keyed(text: &str, key: &str) -> Option<u64> {
     })
 }
 
-#[cfg(target_os = "linux")]
 impl CgroupReport {
+    #[cfg(target_os = "linux")]
     pub fn read(dir: &std::path::Path) -> Self {
         let events = read_limit(dir, "memory.events").unwrap_or_default();
         let pids = read_limit(dir, "pids.events").unwrap_or_default();
