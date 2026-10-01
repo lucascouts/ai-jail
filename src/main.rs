@@ -1223,7 +1223,11 @@ mod tests {
             ..Config::default()
         };
         let error = validate_network_flags(&alone).unwrap_err();
-        assert!(error.contains("needs --allow-host"));
+        if cfg!(target_os = "linux") {
+            assert!(error.contains("needs --allow-host"), "{error}");
+        } else {
+            assert!(error.contains("Linux-only"), "{error}");
+        }
         let with_network = Config {
             transparent_egress: Some(true),
             network: Some(true),
