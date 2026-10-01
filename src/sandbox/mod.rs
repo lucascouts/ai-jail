@@ -1178,7 +1178,9 @@ pub struct TransparentFds<'a> {
 /// Supervisor-side endpoints a launch wires into bwrap beyond the egress
 /// proxy socket (Linux): `--forward-port` sockets and the transparent-egress
 /// fds. Empty by default.
+/// Read only by the bwrap path; macOS has neither feature.
 #[derive(Clone, Copy, Default)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub struct LaunchExtras<'a> {
     pub forward_sockets: &'a [(u16, PathBuf)],
     pub transparent: Option<TransparentFds<'a>>,
