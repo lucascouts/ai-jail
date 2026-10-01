@@ -24,7 +24,7 @@ hostile workloads.
 | Linked-worktree metadata | off               | off               | `--worktree` exposes validated worktree metadata read-write so git can write objects and refs; the common dir may sit outside the project. `--lockdown` keeps it read-only.                  |
 | Docker                   | off               | off               | `--docker` is root-equivalent through the daemon.                                                                                                                                            |
 | systemd user bus         | off               | n/a               | `--systemd-user` can ask the host user manager to run services.                                                                                                                              |
-| Host loopback forward    | off               | n/a               | `--forward-port PORT` exposes the host service on `127.0.0.1:PORT` (or `::1`) in full, under `--lockdown` too, with no allowlist, inspection or audit record; at most 256 relays at once.  |
+| Host loopback forward    | off               | n/a               | `--forward-port PORT` exposes the host service on `127.0.0.1:PORT` (or `::1`) in full, under `--lockdown` too, with no allowlist, inspection or audit record; at most 256 relays at once.    |
 
 `--display` does not imply X11: X11 needs `--x11`. `--browser` reuses an
 isolated profile but still requires explicit `--network` and, on Linux,
