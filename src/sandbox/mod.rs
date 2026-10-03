@@ -1475,6 +1475,28 @@ fn prepare_seatbelt_config(config: &Config) -> Result<Config, String> {
     Ok(prepared)
 }
 
+/// Transparent egress plumbing for one launch (Linux): the fds bwrap
+/// reports on and blocks on, and the resolv.conf naming the fake resolver.
+/// Read only by the bwrap path; macOS has no transparent egress.
+#[derive(Clone, Copy)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub struct TransparentFds<'a> {
+    pub info_fd: std::os::fd::RawFd,
+    pub block_fd: std::os::fd::RawFd,
+    pub resolv: &'a Path,
+}
+
+/// Supervisor-side endpoints a launch wires into bwrap beyond the egress
+/// proxy socket (Linux): `--forward-port` sockets and the transparent-egress
+/// fds. Empty by default.
+/// Read only by the bwrap path; macOS has neither feature.
+#[derive(Clone, Copy, Default)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub struct LaunchExtras<'a> {
+    pub forward_sockets: &'a [(u16, PathBuf)],
+    pub transparent: Option<TransparentFds<'a>>,
+}
+
 /// Build the sandbox command.
 ///
 /// `sandbox_tty` is the device the child will use as its terminal, when
@@ -1493,7 +1515,7 @@ pub fn build(
     verbose: bool,
     sandbox_tty: Option<&Path>,
     proxy: Option<&crate::proxy::Proxy>,
-    forward_sockets: &[(u16, PathBuf)],
+    extras: LaunchExtras<'_>,
 ) -> Result<Command, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1504,12 +1526,13 @@ pub fn build(
             project_dir,
             verbose,
             proxy.and_then(|p| p.unix_path()),
-            forward_sockets,
+            extras.forward_sockets,
+            extras.transparent,
         )
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (guard, forward_sockets);
+        let _ = (guard, extras);
         let prepared = prepare_seatbelt_config(config)?;
         Ok(seatbelt::build(
             &prepared,

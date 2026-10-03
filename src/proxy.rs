@@ -22,7 +22,8 @@
 
 use std::io::{self, Read, Write};
 use std::net::{
-    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream, ToSocketAddrs,
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream,
+    ToSocketAddrs,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -55,6 +56,11 @@ pub(crate) struct ProxyConfig {
     /// tests can CONNECT to loopback fixture servers. Must never become
     /// settable from config or CLI in later phases.
     pub danger_allow_private: bool,
+    /// Test-only: resolve exactly this name to loopback instead of asking
+    /// the system resolver (tests/transparent_egress.rs needs a name that
+    /// no NSS module answers inside the sandbox). Same rule as
+    /// `danger_allow_private`: never config- or CLI-exposable.
+    pub danger_loopback_name: Option<String>,
     /// Shared audit-log handle (phase 5): when the launch audit log is
     /// on, each CONNECT appends a verdict record. The file is
     /// supervisor-side; the sandbox never sees it.
@@ -78,6 +84,7 @@ impl ProxyConfig {
             connect_timeout: Duration::from_secs(10),
             read_timeout: Duration::from_secs(10),
             danger_allow_private: false,
+            danger_loopback_name: None,
             audit: None,
             secrets: Vec::new(),
             danger_extra_roots: Vec::new(),
@@ -544,9 +551,17 @@ fn connect_upstream(
     port: u16,
     config: &ProxyConfig,
 ) -> Result<TcpStream, Reject> {
-    let addrs = match (host, port).to_socket_addrs() {
-        Ok(addrs) => addrs,
-        Err(_) => return Err(Reject::BadGateway),
+    let addrs: Vec<SocketAddr> = if config
+        .danger_loopback_name
+        .as_deref()
+        .is_some_and(|name| normalize_host(name) == normalize_host(host))
+    {
+        vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))]
+    } else {
+        match (host, port).to_socket_addrs() {
+            Ok(addrs) => addrs.collect(),
+            Err(_) => return Err(Reject::BadGateway),
+        }
     };
     let mut dialable = false;
     for addr in addrs {

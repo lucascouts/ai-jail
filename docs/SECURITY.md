@@ -249,6 +249,27 @@ granted access to. On both platforms, kernel and driver bugs, terminal emulator
 bugs (especially after terminal passthrough), and sandbox backend defects remain
 residual risk.
 
+### Transparent egress (`--transparent-egress`, Linux)
+
+The helper that serves the fake resolver and the port-80/443 listeners runs
+**outside** the sandbox's restrictions, like the egress proxy itself. It joins
+the sandbox's user and network namespaces only -- never its mount or pid
+namespace -- because the invoking user owns that user namespace and so may
+bind privileged ports there; the sandboxed agent may not, and keeps zero
+capabilities. The helper drops every capability (all sets, plus
+`no_new_privs`) once bound and before the agent starts (`bwrap --block-fd`).
+
+What it exposes to the sandbox: a DNS parser (single question, no compression
+pointers, names restricted to `[A-Za-z0-9._-]` so a name can never alter the
+`CONNECT` line it becomes) and opaque byte relays. What it decides: nothing --
+every connection is handed to the proxy, which applies the allowlist, the
+SSRF guard and DNS pinning exactly as for proxy-aware clients. Names outside
+the allowlist get NXDOMAIN; addresses the resolver never handed out lead
+nowhere. The sandbox cannot see, signal or trace the helper (separate pid
+namespace), and the helper exits with the supervisor (its stdin is the
+supervisor's pipe). If the helper fails to come up, the sandbox is killed
+before the agent runs.
+
 ## Reporting vulnerabilities
 
 Do not open a public issue for a suspected vulnerability. Use GitHub's private

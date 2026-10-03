@@ -15,6 +15,8 @@ mod sandbox;
 mod secret;
 mod signals;
 mod statusbar;
+#[cfg(target_os = "linux")]
+mod transparent;
 
 #[cfg(test)]
 mod test_utils;
@@ -176,6 +178,23 @@ fn prepare_secrets(
     Ok(bindings)
 }
 
+/// Ports intercepted by transparent egress: 80 and 443. Under the
+/// `test-hooks` feature only, AI_JAIL_TEST_TRANSPARENT_PORTS overrides them
+/// (tests/transparent_egress.rs), because a host fixture cannot listen on a
+/// privileged port. A default build has no env read and no string.
+#[cfg(all(target_os = "linux", feature = "test-hooks"))]
+fn transparent_ports() -> Vec<u16> {
+    std::env::var("AI_JAIL_TEST_TRANSPARENT_PORTS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|p| p.parse().ok()).collect())
+        .unwrap_or_else(|| transparent::DEFAULT_PORTS.to_vec())
+}
+
+#[cfg(all(target_os = "linux", not(feature = "test-hooks")))]
+fn transparent_ports() -> Vec<u16> {
+    transparent::DEFAULT_PORTS.to_vec()
+}
+
 /// Test-only escape hatches, compiled in ONLY under the `test-hooks` feature.
 /// A default build (release, `cargo install`, CI without the feature) gets the
 /// inert fallbacks below, so neither the env-var reads nor their strings exist
@@ -211,6 +230,19 @@ fn test_allow_private() -> bool {
 #[cfg(all(target_os = "linux", not(feature = "test-hooks")))]
 fn test_allow_private() -> bool {
     false
+}
+
+/// A hostname the proxy resolves to loopback, for the transparent-egress
+/// fixture (tests/transparent_egress.rs). `None` outside `test-hooks`, with
+/// no env read.
+#[cfg(all(target_os = "linux", feature = "test-hooks"))]
+fn test_loopback_name() -> Option<String> {
+    std::env::var("AI_JAIL_TEST_PROXY_LOOPBACK_NAME").ok()
+}
+
+#[cfg(all(target_os = "linux", not(feature = "test-hooks")))]
+fn test_loopback_name() -> Option<String> {
+    None
 }
 
 /// Network-mode contradiction checks, all fail-closed at launch.
@@ -253,6 +285,23 @@ fn validate_network_flags(config: &config::Config) -> Result<(), String> {
     }
     if config.browser_profile().is_some() && !config.allow_hosts().is_empty() {
         return Err("--browser and --allow-host cannot be combined: browsers need real DNS and many domains".into());
+    }
+    if config.transparent_egress_enabled() {
+        if cfg!(not(target_os = "linux")) {
+            return Err("--transparent-egress is Linux-only".into());
+        }
+        if config.network_mode() != config::NetworkMode::Filtered {
+            return Err("--transparent-egress needs --allow-host: it routes through the filtered-egress proxy and grants nothing beyond its allowlist".into());
+        }
+        // Both would listen on the same in-sandbox port.
+        #[cfg(target_os = "linux")]
+        for port in transparent_ports() {
+            if config.forward_ports().contains(&port) {
+                return Err(format!(
+                    "--forward-port {port} collides with --transparent-egress, which listens on that port inside the sandbox"
+                ));
+            }
+        }
     }
     validate_forward_ports(config)
 }
@@ -669,6 +718,34 @@ fn run() -> Result<i32, String> {
         return proxy::run_bridge(*port, socket).map(|()| 0);
     }
 
+    // Internal: the supervisor-side transparent-egress helper (started by
+    // the supervisor with the marker env var; top-level invocation is
+    // refused). It joins an existing sandbox's namespaces, so it must
+    // never be reachable as a launch option.
+    #[cfg(target_os = "linux")]
+    if let Some((pid, socket, ports)) = &cli.transparent_helper {
+        if std::env::var_os(transparent::HELPER_MARKER).is_none() {
+            return Err(
+                "--transparent-helper is an internal mode, not a launch option"
+                    .into(),
+            );
+        }
+        return transparent::run_helper(
+            *pid,
+            socket,
+            ports,
+            cli.command.clone(),
+        )
+        .map(|()| 0);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if cli.transparent_helper.is_some() {
+        return Err(
+            "--transparent-helper is an internal mode, not a launch option"
+                .into(),
+        );
+    }
+
     // Offline audit commands bypass configuration and sandbox setup.
     if cli.audit_show {
         return run_audit_show();
@@ -965,6 +1042,7 @@ fn run() -> Result<i32, String> {
         // (`cargo build --release`, `cargo install`) has neither the env-var
         // read nor the string, so they cannot be reached at runtime.
         proxy_config.danger_allow_private = test_allow_private();
+        proxy_config.danger_loopback_name = test_loopback_name();
         proxy_config.danger_extra_roots = test_extra_roots();
         // The audit handle is supervisor-side; the sandbox never sees
         // the file it appends to.
@@ -1141,6 +1219,23 @@ fn run() -> Result<i32, String> {
     // known while the sandbox profile is still being generated.
     let pty = if use_pty { Some(pty::open()?) } else { None };
     let sandbox_tty = pty.as_ref().and_then(pty::Pty::slave_path);
+    // Transparent egress (Linux): pipes and resolv.conf first -- bwrap's
+    // command line names them -- then the helper is armed right before
+    // either spawn path below. Dropped last (declared here), after the
+    // child has exited: that stops the helper.
+    #[cfg(target_os = "linux")]
+    let mut transparent = if config.transparent_egress_enabled() {
+        Some(transparent::Transparent::prepare()?)
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let transparent_fds = transparent
+        .as_ref()
+        .map(transparent::Transparent::launch_fds);
+    #[cfg(not(target_os = "linux"))]
+    let transparent_fds = None;
+
     let mut cmd = sandbox::build(
         &guard,
         &config,
@@ -1148,8 +1243,21 @@ fn run() -> Result<i32, String> {
         cli.verbose,
         sandbox_tty.as_deref(),
         egress_proxy.as_ref(),
-        &forward_sockets,
+        sandbox::LaunchExtras {
+            forward_sockets: &forward_sockets,
+            transparent: transparent_fds,
+        },
     )?;
+
+    #[cfg(target_os = "linux")]
+    if let Some(t) = transparent.as_mut() {
+        let socket = egress_proxy
+            .as_ref()
+            .and_then(proxy::Proxy::unix_path)
+            .ok_or("transparent egress requires the egress proxy socket")?
+            .to_path_buf();
+        t.activate(socket, transparent_ports(), config.allow_hosts().to_vec());
+    }
 
     // Apply NOFILE and CORE limits on the parent (inherited by child
     // across fork+exec). NPROC is applied inside the sandbox instead
@@ -1402,6 +1510,53 @@ mod tests {
             validate_network_flags(&ok).is_ok(),
             cfg!(target_os = "linux")
         );
+    }
+
+    #[test]
+    fn transparent_egress_needs_filtered_egress() {
+        let alone = Config {
+            transparent_egress: Some(true),
+            ..Config::default()
+        };
+        let error = validate_network_flags(&alone).unwrap_err();
+        if cfg!(target_os = "linux") {
+            assert!(error.contains("needs --allow-host"), "{error}");
+        } else {
+            assert!(error.contains("Linux-only"), "{error}");
+        }
+        let with_network = Config {
+            transparent_egress: Some(true),
+            network: Some(true),
+            ..Config::default()
+        };
+        assert!(validate_network_flags(&with_network).is_err());
+        let ok = Config {
+            transparent_egress: Some(true),
+            allow_hosts: vec!["laratranslate.com".into()],
+            ..Config::default()
+        };
+        assert_eq!(
+            validate_network_flags(&ok).is_ok(),
+            cfg!(target_os = "linux")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forward_port_on_a_transparent_port_is_refused() {
+        let clash = Config {
+            transparent_egress: Some(true),
+            allow_hosts: vec!["example.com".into()],
+            forward_ports: vec![443],
+            ..Config::default()
+        };
+        let error = validate_network_flags(&clash).unwrap_err();
+        assert!(error.contains("collides with --transparent-egress"));
+        let fine = Config {
+            forward_ports: vec![49374],
+            ..clash
+        };
+        assert!(validate_network_flags(&fine).is_ok());
     }
 
     #[test]

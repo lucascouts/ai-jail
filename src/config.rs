@@ -280,6 +280,12 @@ pub struct Config {
     /// the untrusted project `.ai-jail` may only shrink this list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forward_ports: Vec<u16>,
+    /// Transparent egress (Linux): also route clients that ignore the
+    /// proxy environment through the filtered-egress proxy, via a fake
+    /// resolver and loopback listeners run outside the sandbox. Trusted
+    /// capability: the untrusted project `.ai-jail` may only turn it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparent_egress: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_dir: Option<PathBuf>,
     /// Trusted capability: mount the invoked agent's own state
@@ -541,6 +547,9 @@ impl Config {
     /// check each place.
     pub fn agent_state_enabled(&self) -> bool {
         self.agent_state != Some(false) && !self.lockdown_enabled()
+    }
+    pub fn transparent_egress_enabled(&self) -> bool {
+        self.transparent_egress == Some(true)
     }
     /// Full host-environment inheritance is a trusted capability:
     /// disabled unless explicitly enabled. Default keeps only the
@@ -1115,6 +1124,7 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(no_rlimits);
     take!(systemd_user);
     take!(agent_state);
+    take!(transparent_egress);
     take!(inherit_env);
     take!(update_check);
     take!(audit_log);
@@ -1474,6 +1484,8 @@ pub fn merge_with_global_report(
     monotonic!(no_toolchains, |config: &Config| config.toolchains_enabled());
     monotonic!(no_worktree, |config: &Config| config.worktree_enabled());
     monotonic!(agent_state, |config: &Config| config.agent_state_enabled());
+    monotonic!(transparent_egress, |config: &Config| config
+        .transparent_egress_enabled());
     monotonic!(inherit_env, |config: &Config| config.inherit_env_enabled());
     monotonic!(update_check, |config: &Config| config
         .update_check_enabled());
@@ -1996,6 +2008,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     direct!(host_shm);
     direct!(terminal_passthrough);
     direct!(agent_state);
+    direct!(transparent_egress);
     direct!(inherit_env);
     direct!(update_check);
     direct!(audit_log);
@@ -2353,6 +2366,7 @@ fn print_network_mode(config: &Config) {
             .join(", ");
         output::status_header("  Forward ports", &joined);
     }
+    print_opt_in_enabled("  Transparent egress", config.transparent_egress);
 }
 
 #[cfg(test)]
@@ -3830,6 +3844,7 @@ no_gpu = true
             allow_tcp_ports: vec![32000, 8080],
             allow_hosts: vec!["api.anthropic.com".into()],
             forward_ports: vec![49374],
+            transparent_egress: Some(true),
             claude_dir: None,
             agent_state: Some(true),
             inherit_env: None,
@@ -3880,6 +3895,7 @@ no_gpu = true
         assert_eq!(deserialized.allow_tcp_ports, config.allow_tcp_ports);
         assert_eq!(deserialized.allow_hosts, config.allow_hosts);
         assert_eq!(deserialized.forward_ports, config.forward_ports);
+        assert_eq!(deserialized.transparent_egress, config.transparent_egress);
         assert_eq!(deserialized.claude_dir, config.claude_dir);
         assert_eq!(deserialized.agent_state, config.agent_state);
         assert_eq!(deserialized.inherit_env, config.inherit_env);
@@ -4949,6 +4965,56 @@ allow_tcp_ports = []
                 .iter()
                 .any(|w| w.contains("allow_hosts") && w.contains("evil.com"))
         );
+    }
+
+    #[test]
+    fn regression_v2_2_0_config_without_transparent_egress() {
+        // Configs written before transparent_egress existed must still
+        // parse, with the capability off, and never write it back.
+        let toml = r#"
+command = ["claude"]
+allow_hosts = ["api.anthropic.com"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.transparent_egress, None);
+        assert!(!config.transparent_egress_enabled());
+        assert!(
+            !toml::to_string(&config)
+                .unwrap()
+                .contains("transparent_egress")
+        );
+    }
+
+    #[test]
+    fn project_cannot_enable_transparent_egress() {
+        let project = Config {
+            transparent_egress: Some(true),
+            ..Config::default()
+        };
+        let (merged, _) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(!merged.transparent_egress_enabled());
+        // It may turn a trusted opt-in off.
+        let baseline = Config {
+            transparent_egress: Some(true),
+            ..Config::default()
+        };
+        let project = Config {
+            transparent_egress: Some(false),
+            ..Config::default()
+        };
+        let (merged, _) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert!(!merged.transparent_egress_enabled());
+        // The CLI enables it.
+        let cli = CliArgs {
+            transparent_egress: Some(true),
+            ..CliArgs::default()
+        };
+        assert!(merge(&cli, Config::default()).transparent_egress_enabled());
     }
 
     #[test]
@@ -6702,6 +6768,7 @@ hide_dotdirs = [".my_secrets"]
             allow_tcp_ports: vec![32000],
             allow_hosts: vec![],
             forward_ports: vec![],
+            transparent_egress: None,
             claude_dir: None,
             agent_state: None,
             inherit_env: None,
