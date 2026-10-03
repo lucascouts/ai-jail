@@ -343,6 +343,11 @@ pub(crate) struct LaunchRecord<'a> {
     pub global_config: bool,
     pub exit_code: i32,
     pub duration: std::time::Duration,
+    /// Resource limits requested for the launch, when any were set.
+    pub limits: Option<serde_json::Value>,
+    /// What the sandbox cgroup counted (OOM kills, peak memory, ...),
+    /// when the launch ran in its own scope.
+    pub cgroup: Option<serde_json::Value>,
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
@@ -613,6 +618,8 @@ pub(crate) fn launch_record(record: &LaunchRecord<'_>) -> serde_json::Value {
         },
         "exit_code": record.exit_code,
         "duration_s": record.duration.as_millis() as f64 / 1000.0,
+        "limits": record.limits,
+        "cgroup": record.cgroup,
     })
 }
 
@@ -832,6 +839,8 @@ mod tests {
             global_config: true,
             exit_code: 0,
             duration: std::time::Duration::from_millis(1500),
+            limits: Some(serde_json::json!({"memory": 1024})),
+            cgroup: Some(serde_json::json!({"oom_kills": 1})),
         };
         log.record(launch_record(&launch));
         log.record(connect_record(
@@ -852,6 +861,8 @@ mod tests {
         assert_eq!(lines[0]["network"], "filtered");
         assert_eq!(lines[0]["exit_code"], 0);
         assert_eq!(lines[0]["duration_s"], 1.5);
+        assert_eq!(lines[0]["limits"]["memory"], 1024);
+        assert_eq!(lines[0]["cgroup"]["oom_kills"], 1);
         assert_eq!(lines[1]["type"], "connect");
         assert_eq!(lines[1]["host"], "api.anthropic.com");
         assert_eq!(lines[1]["verdict"], "allow");

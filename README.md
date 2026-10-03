@@ -186,6 +186,26 @@ no UDP, and no working DNS inside the sandbox on Linux (on macOS the system
 resolver is not fenced). It cannot combine with `--network` or `--browser`,
 and a project `.ai-jail` may only shrink the list, never grow it.
 
+### Clients that ignore the proxy: `--transparent-egress`
+
+Filtered egress reaches clients that honor `HTTPS_PROXY`. A client with its
+own HTTP agent or raw sockets resolves DNS itself, finds none, and fails.
+`--transparent-egress` (Linux; with `--allow-host`) routes those clients
+through the same proxy: the sandbox's resolver answers each allowlisted name
+with a private loopback address (`127.64.0.0/10`) and everything else with
+NXDOMAIN, and connections to those addresses on ports 80 and 443 become
+`CONNECT name:port` to the unchanged proxy. The allowlist, SSRF guard and
+DNS pinning stay on the host; nothing is resolved inside the sandbox, so
+it adds no DNS channel: the only lookups on the host are the proxy's, for
+allowlisted names, as for a proxy-aware client. The helper runs outside the
+sandbox but holds no capabilities and, where Landlock exists, no filesystem
+access once its ports are bound; it maps at most 65,536 names per launch.
+
+The resolver and listeners need privileged ports, which the agent must never
+hold, so they run in a supervisor-side helper that joins only the sandbox's
+user and network namespaces, binds, drops every capability, and only then
+lets the agent start. The agent itself keeps zero capabilities.
+
 ### Phantom credentials: `--secret KEY=host`
 
 With filtered egress on, `--secret ANTHROPIC_API_KEY=api.anthropic.com`
@@ -199,6 +219,34 @@ covers clients that can speak plain HTTP to the proxy (e.g. an
 re-originated over TLS by the supervisor, which therefore sees that plaintext
 for secret-bound hosts. HTTPS clients that only CONNECT keep working exactly
 as before, with no substitution.
+
+### Host loopback services: `--forward-port PORT`
+
+Without `--network` the sandbox has its own loopback, so services listening
+on the host's `127.0.0.1` — a local MCP server, an editor's IDE socket, a
+dev database — are unreachable. `--forward-port 49374` (repeatable, or
+`forward_ports = [...]` in the global config) relays exactly that port: the
+supervisor connects a per-launch Unix socket to the host's
+`127.0.0.1:49374` (falling back to `[::1]:49374`, for services bound to
+`localhost` over IPv6 only), and an in-sandbox bridge listens on the
+sandbox's own `127.0.0.1:49374` and pumps into it. The agent starts only
+once every bridge is listening, and a bridge that cannot bind fails the
+launch. The private network namespace stays up; every other host port stays
+unreachable. It combines with filtered egress and `--lockdown` (the port
+joins the Landlock V4 connect allow set), and is Linux-only. Ports below
+1024 are refused: the sandbox cannot bind them.
+
+It cannot combine with `--network`, where the host loopback is already
+reachable, and it is refused outside Linux — so a `forward_ports` entry in
+the global config fails every `--network` or `--browser` launch, and every
+launch on macOS; put it under a command-specific table instead.
+
+A forwarded port is trusted in full: there is no allowlist, inspection or
+audit record on it, so the agent can do whatever the service behind it
+accepts. At most 256 relays run at once. Only the CLI and global config can
+open a forward: a project `.ai-jail` cannot, unless the global config lists
+it under `trust_project_config`. Forwards are never written into a project
+file by auto-save or `--init`.
 
 `--allow-tcp-port` remains accepted for backward compatibility, but launch
 fails closed because UDP cannot be securely constrained through this option —
@@ -436,6 +484,43 @@ boundary: `--claude-dir` with a separate directory is. For the `claude`
 command itself, `--agent-state` plus `--map` already gives read-only holes
 without this rule.
 
+## Resource limits
+
+rlimits (on by default) cap each process on its own. To cap the sandbox as a
+whole — and to learn why it died — use the cgroup limits (Linux):
+
+```bash
+ai-jail --memory 8G --max-tasks 2000 --cpu-quota 400% --cpus 8-15 claude
+```
+
+- `--memory SIZE` caps RAM for everything inside, with swap off so a runaway
+  agent is killed instead of stalling the host.
+- `--max-tasks N` caps processes **and threads** (`pids.max`); a Node or JVM
+  agent alone runs dozens of threads, so size it generously.
+- `--cpu-quota PCT` caps CPU time, in percent of one CPU.
+- `--cpus LIST` restricts the sandbox to those CPUs (`8,24`, `0-3`).
+
+The first three need a systemd user session and no privilege: ai-jail
+re-execs itself through `systemd-run --user --scope`, which puts the
+supervisor and the sandbox in one fresh cgroup, then checks that the kernel
+really enforces the limits — or refuses to launch. The PID, stdio and signals
+are unchanged, so `--exec` clients (ACP adapters, harnesses) see no
+difference. `--cpus` needs no systemd: it is CPU affinity, and seccomp then
+refuses `sched_setaffinity` so nothing inside can widen it (it therefore
+requires seccomp).
+
+When the sandbox dies, ai-jail says why on stderr, also under `--exec`:
+
+```text
+✗ sandbox exited with 137: out of memory: the kernel killed 1 process(es) at
+  the sandbox memory limit (8.0 GiB, peak 8.0 GiB)
+```
+
+With `--audit-log`, the launch record carries the limits and what the cgroup
+counted (`oom_kills`, `memory_peak`, `tasks_refused`, `cpu_usage_usec`). The
+config fields are `memory_max`, `max_tasks`, `cpu_quota` and `cpus`; a project
+`.ai-jail` may add or lower a limit, never raise it.
+
 ## Browsers
 
 `--browser[=hard|soft]` reuses an isolated browser profile, but browsers still
@@ -474,7 +559,8 @@ Common fields: `command`, `rw_maps`, `ro_maps`, `overlay_maps`, `mask`,
 `deny_paths`, `mask_exceptions`, `deny_path_exceptions`, `hide_dotdirs`,
 `network`, `x11`, `host_shm`, `terminal_passthrough`, `macos_host_ipc`,
 `systemd_user`, `kvm`, `ssh`, `pictures`, `private_home`, `lockdown`,
-`browser_profile`, `claude_dir`, `allow_tcp_ports`, `status_bar_style`.
+`browser_profile`, `claude_dir`, `allow_tcp_ports`, `status_bar_style`,
+`memory_max`, `max_tasks`, `cpu_quota`, `cpus`.
 
 Global config only: `env_pass` (see Environment policy above) and
 `trust_project_config`, which lists directories whose project
@@ -510,6 +596,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --deny-path PATH|GLOB           deny project paths
 --agent-state / --no-agent-state  mount the command's credential state (default off)
 --env NAME[=VALUE]              forward or set an environment variable (repeatable)
+--forward-port PORT             relay host 127.0.0.1:PORT into the sandbox (Linux, repeatable)
 --inherit-env / --no-inherit-env  pass the full parent environment (default: allowlist)
 --update-check / --no-update-check  host-side version check (default off)
 --lockdown / --no-lockdown      strict read-only mode, no network by default
@@ -520,6 +607,10 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --systemd-user / --no-systemd-user  host user manager access (off by default)
 --ssh / --no-ssh                read-only SSH/agent sharing (off by default)
 --claude-dir PATH               explicit Claude state directory
+--memory SIZE / --max-tasks N / --cpu-quota PCT
+                                cap the whole sandbox (Linux, systemd user
+                                session; see Resource limits)
+--cpus LIST                     pin the sandbox to CPUs, locked by seccomp
 --browser[=hard|soft]           isolated browser profile (needs --network --display)
 --dry-run                       print the backend invocation
 --init                          write configuration and exit
